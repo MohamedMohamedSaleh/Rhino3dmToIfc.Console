@@ -117,7 +117,7 @@ public sealed class IfcGeometryBuilder
         shapeRepresentation.RepresentationIdentifier = "Body";
         shapeRepresentation.RepresentationType = "Tessellation";
         shapeRepresentation.Items.Add(faceSet);
-        AssignToLayer(faceSet, source.LayerName, layers);
+        AssignToLayers(faceSet, source, layers);
 
         var productShape = model.Instances.New<IfcProductDefinitionShape>();
         productShape.Representations.Add(shapeRepresentation);
@@ -187,7 +187,7 @@ public sealed class IfcGeometryBuilder
         shapeRepresentation.RepresentationIdentifier = "Body";
         shapeRepresentation.RepresentationType = "Tessellation";
         shapeRepresentation.Items.Add(faceSet);
-        AssignToLayer(faceSet, source.LayerName, layers);
+        AssignToLayers(faceSet, source, layers);
 
         var productShape = model.Instances.New<IfcProductDefinitionShape>();
         productShape.Representations.Add(shapeRepresentation);
@@ -234,7 +234,7 @@ public sealed class IfcGeometryBuilder
         var polyline = model.Instances.New<IfcPolyline>();
         polyline.Points.Add(start);
         polyline.Points.Add(end);
-        AssignToLayer(polyline, source.LayerName, layers);
+        AssignToLayers(polyline, source, layers);
 
         var shapeRepresentation = model.Instances.New<IfcShapeRepresentation>();
         shapeRepresentation.ContextOfItems = context;
@@ -248,19 +248,65 @@ public sealed class IfcGeometryBuilder
         return true;
     }
 
+    private static void AssignToLayers(IfcRepresentationItem item, RhinoBimObject source, IDictionary<string, IfcPresentationLayerAssignment> layers)
+    {
+        foreach (var layerName in GetObjectLayerNames(source))
+        {
+            AssignToLayer(item, layerName, layers);
+        }
+    }
+
+    private static IEnumerable<string> GetObjectLayerNames(RhinoBimObject source)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var primaryLayerName = string.IsNullOrWhiteSpace(source.LayerName) ? "Default" : source.LayerName.Trim();
+        if (seen.Add(primaryLayerName))
+        {
+            yield return primaryLayerName;
+        }
+
+        foreach (var layerName in source.AdditionalLayerNames)
+        {
+            if (!string.IsNullOrWhiteSpace(layerName) && seen.Add(layerName.Trim()))
+            {
+                yield return layerName.Trim();
+            }
+        }
+    }
+
     private static void AssignToLayer(IfcRepresentationItem item, string layerName, IDictionary<string, IfcPresentationLayerAssignment> layers)
     {
         var cleanLayerName = string.IsNullOrWhiteSpace(layerName) ? "Default" : layerName.Trim();
-        if (!layers.TryGetValue(cleanLayerName, out var layer))
+        foreach (var layerPath in GetLayerPathNames(cleanLayerName))
         {
-            layer = item.Model.Instances.New<IfcPresentationLayerAssignment>();
-            layer.Name = cleanLayerName;
-            layer.Identifier = cleanLayerName;
-            layer.Description = $"Rhino layer: {cleanLayerName}";
-            layers[cleanLayerName] = layer;
+            if (!layers.TryGetValue(layerPath, out var layer))
+            {
+                layer = item.Model.Instances.New<IfcPresentationLayerAssignment>();
+                layer.Name = layerPath;
+                layer.Identifier = layerPath;
+                layer.Description = $"Rhino layer: {layerPath}";
+                layers[layerPath] = layer;
+            }
+
+            layer.AssignedItems.Add(item);
+        }
+    }
+
+    private static IEnumerable<string> GetLayerPathNames(string layerName)
+    {
+        var parts = layerName.Split("::", StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0)
+        {
+            yield return "Default";
+            yield break;
         }
 
-        layer.AssignedItems.Add(item);
+        var current = string.Empty;
+        foreach (var part in parts)
+        {
+            current = string.IsNullOrWhiteSpace(current) ? part : $"{current}::{part}";
+            yield return current;
+        }
     }
 
     private static void AddTriangle(IfcTriangulatedFaceSet faceSet, int a, int b, int c)

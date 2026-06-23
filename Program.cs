@@ -59,7 +59,7 @@ try
     log.Info($"Total readable objects: {summary.TotalObjects}");
 
     var classifiedObjects = classifier.Classify(objects, options, summary);
-    modelBuilder.BuildAndSave(classifiedObjects, options, summary);
+    modelBuilder.BuildAndSave(classifiedObjects, reader.LastReadLayers, options, summary);
 
     log.Info("Export completed.");
     log.WriteSummary(summary);
@@ -93,4 +93,3 @@ static void PrintSummary(ExportSummary summary)
     System.Console.WriteLine($"IFC output:          {summary.OutputPath}");
     System.Console.WriteLine($"Log file:            {summary.LogPath}");
 }
-

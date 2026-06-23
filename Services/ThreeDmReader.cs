@@ -9,6 +9,8 @@ public sealed class ThreeDmReader
 {
     private readonly LogService _log;
 
+    public IReadOnlyList<RhinoLayerInfo> LastReadLayers { get; private set; } = [];
+
     public ThreeDmReader(LogService log)
     {
         _log = log;
@@ -17,6 +19,7 @@ public sealed class ThreeDmReader
     public List<RhinoBimObject> Read(string inputPath)
     {
         var file = File3dm.Read(inputPath) ?? throw new InvalidOperationException($"Unable to read 3DM file: {inputPath}");
+        LastReadLayers = ReadLayers(file);
         var result = new List<RhinoBimObject>();
         var objectById = file.Objects
             .Where(fileObject => fileObject.HasId)
@@ -44,7 +47,18 @@ public sealed class ThreeDmReader
         }
 
         _log.Info($"Read {result.Count} non-deleted objects from 3DM.");
+        _log.Info($"Read {LastReadLayers.Count} Rhino layers from 3DM.");
         return result;
+    }
+
+    private static IReadOnlyList<RhinoLayerInfo> ReadLayers(File3dm file)
+    {
+        return file.AllLayers
+            .Select(layer => FirstNonEmpty(layer.FullPath, layer.Name))
+            .Where(layerName => !string.IsNullOrWhiteSpace(layerName))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(layerName => new RhinoLayerInfo { Name = layerName })
+            .ToList();
     }
 
     private void ExpandInstanceReference(
@@ -95,7 +109,9 @@ public sealed class ThreeDmReader
         Transform transform,
         File3dmObject? instanceObject)
     {
-        var layerName = ResolveLayerName(file, attributes.LayerIndex);
+        var definitionLayerName = ResolveLayerName(file, attributes.LayerIndex);
+        var instanceLayerName = instanceObject?.Attributes is null ? string.Empty : ResolveLayerName(file, instanceObject.Attributes.LayerIndex);
+        var layerName = FirstNonEmpty(instanceLayerName, definitionLayerName);
         var name = FirstNonEmpty(attributes.Name, fileObject.Name, instanceObject?.Name, fileObject.Id.ToString());
         var copiedGeometry = geometry.Duplicate();
         if (!transform.IsIdentity)
@@ -117,10 +133,22 @@ public sealed class ThreeDmReader
             RhinoObjectId = instanceObject?.Id ?? fileObject.Id,
             ObjectName = name,
             LayerName = layerName,
+            AdditionalLayerNames = GetAdditionalLayerNames(layerName, definitionLayerName),
             GeometryType = copiedGeometry.GetType().Name,
             UserText = userText,
             Geometry = copiedGeometry
         };
+    }
+
+    private static List<string> GetAdditionalLayerNames(string primaryLayerName, string definitionLayerName)
+    {
+        if (string.IsNullOrWhiteSpace(definitionLayerName) ||
+            string.Equals(primaryLayerName, definitionLayerName, StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        return [definitionLayerName];
     }
 
     private static ObjectAttributes MergeAttributes(ObjectAttributes instanceAttributes, ObjectAttributes partAttributes)

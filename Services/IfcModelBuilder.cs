@@ -34,7 +34,11 @@ public sealed class IfcModelBuilder
         _propertySetBuilder = propertySetBuilder;
     }
 
-    public void BuildAndSave(IReadOnlyList<RhinoBimObject> objects, IfcExportOptions options, ExportSummary summary)
+    public void BuildAndSave(
+        IReadOnlyList<RhinoBimObject> objects,
+        IReadOnlyList<RhinoLayerInfo> rhinoLayers,
+        IfcExportOptions options,
+        ExportSummary summary)
     {
         ConfigureXbim();
 
@@ -64,7 +68,9 @@ public sealed class IfcModelBuilder
             var storeys = new Dictionary<string, IfcBuildingStorey>(StringComparer.OrdinalIgnoreCase);
             var materials = new Dictionary<string, IfcMaterial>(StringComparer.OrdinalIgnoreCase);
             var layers = new Dictionary<string, IfcPresentationLayerAssignment>(StringComparer.OrdinalIgnoreCase);
-            var layerGroups = new Dictionary<string, IfcRelAssignsToGroup>(StringComparer.OrdinalIgnoreCase);
+            var layerGroups = new Dictionary<string, IfcGroup>(StringComparer.OrdinalIgnoreCase);
+            var layerProductRelations = new Dictionary<string, IfcRelAssignsToGroup>(StringComparer.OrdinalIgnoreCase);
+            var rootLayerRelation = CreateRootLayerGroup(model, ownerHistory, rhinoLayers, layerGroups);
 
             foreach (var source in objects)
             {
@@ -90,7 +96,7 @@ public sealed class IfcModelBuilder
                     Contain(model, ownerHistory, storey, product);
                     AssociateMaterial(model, ownerHistory, product, source.IfcMaterial, materials);
                     _propertySetBuilder.AttachPropertySets(product, source, summary);
-                    AssignProductToLayerGroup(model, ownerHistory, product, source.LayerName, layerGroups);
+                    AssignProductToLayerGroups(model, ownerHistory, product, source, layerGroups, layerProductRelations, rootLayerRelation);
 
                     summary.ExportedObjects++;
                     _log.Info($"Exported {source.RhinoObjectId} as {source.IfcType} '{source.IfcName}'.");
@@ -285,27 +291,123 @@ public sealed class IfcModelBuilder
         IfcOwnerHistory ownerHistory,
         IfcProduct product,
         string layerName,
-        Dictionary<string, IfcRelAssignsToGroup> layerGroups)
+        Dictionary<string, IfcGroup> layerGroups,
+        Dictionary<string, IfcRelAssignsToGroup> layerProductRelations,
+        IfcRelAssignsToGroup? rootLayerRelation)
     {
         var normalizedLayerName = string.IsNullOrWhiteSpace(layerName) ? "Default" : layerName.Trim();
-        if (!layerGroups.TryGetValue(normalizedLayerName, out var relation))
-        {
-            var group = model.Instances.New<IfcGroup>();
-            group.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
-            group.OwnerHistory = ownerHistory;
-            group.Name = normalizedLayerName;
-            group.Description = $"Rhino layer: {normalizedLayerName}";
-            group.ObjectType = "Rhino Layer";
+        var group = GetOrCreateLayerGroup(model, ownerHistory, normalizedLayerName, layerGroups);
+        AddLayerGroupToRoot(rootLayerRelation, group);
 
+        if (!layerProductRelations.TryGetValue(normalizedLayerName, out var relation))
+        {
             relation = model.Instances.New<IfcRelAssignsToGroup>();
             relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
             relation.OwnerHistory = ownerHistory;
             relation.Name = $"Products on Rhino layer {normalizedLayerName}";
             relation.RelatingGroup = group;
-            layerGroups[normalizedLayerName] = relation;
+            layerProductRelations[normalizedLayerName] = relation;
         }
 
         relation.RelatedObjects.Add(product);
+    }
+
+    private static void AssignProductToLayerGroups(
+        IfcStore model,
+        IfcOwnerHistory ownerHistory,
+        IfcProduct product,
+        RhinoBimObject source,
+        Dictionary<string, IfcGroup> layerGroups,
+        Dictionary<string, IfcRelAssignsToGroup> layerProductRelations,
+        IfcRelAssignsToGroup? rootLayerRelation)
+    {
+        foreach (var layerName in GetObjectLayerNames(source))
+        {
+            AssignProductToLayerGroup(model, ownerHistory, product, layerName, layerGroups, layerProductRelations, rootLayerRelation);
+        }
+    }
+
+    private static IEnumerable<string> GetObjectLayerNames(RhinoBimObject source)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var primaryLayerName = string.IsNullOrWhiteSpace(source.LayerName) ? "Default" : source.LayerName.Trim();
+        if (seen.Add(primaryLayerName))
+        {
+            yield return primaryLayerName;
+        }
+
+        foreach (var layerName in source.AdditionalLayerNames)
+        {
+            if (!string.IsNullOrWhiteSpace(layerName) && seen.Add(layerName.Trim()))
+            {
+                yield return layerName.Trim();
+            }
+        }
+    }
+
+    private static IfcRelAssignsToGroup? CreateRootLayerGroup(
+        IfcStore model,
+        IfcOwnerHistory ownerHistory,
+        IReadOnlyList<RhinoLayerInfo> rhinoLayers,
+        Dictionary<string, IfcGroup> layerGroups)
+    {
+        if (rhinoLayers.Count == 0)
+        {
+            return null;
+        }
+
+        var rootGroup = model.Instances.New<IfcGroup>();
+        rootGroup.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        rootGroup.OwnerHistory = ownerHistory;
+        rootGroup.Name = "Rhino Layers";
+        rootGroup.Description = "All Rhino layers from the source 3DM file";
+        rootGroup.ObjectType = "Rhino Layer Root";
+
+        var relation = model.Instances.New<IfcRelAssignsToGroup>();
+        relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        relation.OwnerHistory = ownerHistory;
+        relation.Name = "Rhino layer list";
+        relation.RelatingGroup = rootGroup;
+
+        foreach (var layer in rhinoLayers)
+        {
+            var group = GetOrCreateLayerGroup(model, ownerHistory, layer.Name, layerGroups);
+            AddLayerGroupToRoot(relation, group);
+        }
+
+        return relation;
+    }
+
+    private static IfcGroup GetOrCreateLayerGroup(
+        IfcStore model,
+        IfcOwnerHistory ownerHistory,
+        string layerName,
+        Dictionary<string, IfcGroup> layerGroups)
+    {
+        var normalizedLayerName = string.IsNullOrWhiteSpace(layerName) ? "Default" : layerName.Trim();
+        if (layerGroups.TryGetValue(normalizedLayerName, out var existing))
+        {
+            return existing;
+        }
+
+        var group = model.Instances.New<IfcGroup>();
+        group.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        group.OwnerHistory = ownerHistory;
+        group.Name = normalizedLayerName;
+        group.Description = $"Rhino layer: {normalizedLayerName}";
+        group.ObjectType = "Rhino Layer";
+        layerGroups[normalizedLayerName] = group;
+        return group;
+    }
+
+    private static void AddLayerGroupToRoot(IfcRelAssignsToGroup? rootLayerRelation, IfcGroup group)
+    {
+        if (rootLayerRelation is null || rootLayerRelation.RelatedObjects.Contains(group))
+        {
+            return;
+        }
+
+        rootLayerRelation.RelatedObjects.Add(group);
     }
 
     private static IfcLocalPlacement CreateLocalPlacement(IfcStore model)

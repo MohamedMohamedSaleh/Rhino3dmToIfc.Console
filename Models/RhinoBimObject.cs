@@ -8,6 +8,8 @@ public sealed class RhinoBimObject
 
     public string LayerName { get; set; } = string.Empty;
 
+    public List<string> AdditionalLayerNames { get; set; } = [];
+
     public string GeometryType { get; set; } = string.Empty;
 
     public Dictionary<string, string> UserText { get; set; } = new(StringComparer.OrdinalIgnoreCase);
