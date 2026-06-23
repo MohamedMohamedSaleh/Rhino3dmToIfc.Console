@@ -1,0 +1,9 @@
+bin/
+obj/
+
+.DS_Store
+
+*.ifc
+*.log
+*.3dm
+*.3dm.rhl

@@ -93,3 +93,4 @@ static void PrintSummary(ExportSummary summary)
     System.Console.WriteLine($"IFC output:          {summary.OutputPath}");
     System.Console.WriteLine($"Log file:            {summary.LogPath}");
 }
+

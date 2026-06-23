@@ -1,4 +1,5 @@
 using Rhino.FileIO;
+using Rhino.DocObjects;
 using Rhino.Geometry;
 using Rhino3dmToIfc.Console.Models;
 
@@ -17,6 +18,9 @@ public sealed class ThreeDmReader
     {
         var file = File3dm.Read(inputPath) ?? throw new InvalidOperationException($"Unable to read 3DM file: {inputPath}");
         var result = new List<RhinoBimObject>();
+        var objectById = file.Objects
+            .Where(fileObject => fileObject.HasId)
+            .ToDictionary(fileObject => fileObject.Id);
 
         foreach (var fileObject in file.Objects)
         {
@@ -25,23 +29,122 @@ public sealed class ThreeDmReader
                 continue;
             }
 
-            var attributes = fileObject.Attributes;
-            var layerName = ResolveLayerName(file, attributes.LayerIndex);
-            var name = FirstNonEmpty(attributes.Name, fileObject.Name, fileObject.Id.ToString());
-
-            result.Add(new RhinoBimObject
+            if (fileObject.Attributes.IsInstanceDefinitionObject)
             {
-                RhinoObjectId = fileObject.Id,
-                ObjectName = name,
-                LayerName = layerName,
-                GeometryType = fileObject.Geometry.GetType().Name,
-                UserText = ReadUserText(attributes, fileObject.Geometry),
-                Geometry = fileObject.Geometry
-            });
+                continue;
+            }
+
+            if (fileObject.Geometry is InstanceReferenceGeometry instanceReference)
+            {
+                ExpandInstanceReference(file, objectById, fileObject, instanceReference, Transform.Identity, result, 0);
+                continue;
+            }
+
+            result.Add(CreateBimObject(file, fileObject, fileObject.Attributes, fileObject.Geometry, Transform.Identity, null));
         }
 
         _log.Info($"Read {result.Count} non-deleted objects from 3DM.");
         return result;
+    }
+
+    private void ExpandInstanceReference(
+        File3dm file,
+        IReadOnlyDictionary<Guid, File3dmObject> objectById,
+        File3dmObject instanceObject,
+        InstanceReferenceGeometry instanceReference,
+        Transform parentTransform,
+        List<RhinoBimObject> result,
+        int depth)
+    {
+        if (depth > 16)
+        {
+            _log.Warning($"Skipping nested instance {instanceObject.Id}: maximum instance nesting depth reached.");
+            return;
+        }
+
+        var definition = file.AllInstanceDefinitions.FirstOrDefault(candidate => candidate.Id == instanceReference.ParentIdefId);
+        if (definition is null)
+        {
+            _log.Warning($"Skipping instance {instanceObject.Id}: instance definition {instanceReference.ParentIdefId} was not found.");
+            return;
+        }
+
+        var composedTransform = parentTransform * instanceReference.Xform;
+        foreach (var partId in definition.GetObjectIds())
+        {
+            if (!objectById.TryGetValue(partId, out var partObject) || partObject.Geometry is null || partObject.Attributes is null || partObject.IsDeleted)
+            {
+                continue;
+            }
+
+            if (partObject.Geometry is InstanceReferenceGeometry nestedReference)
+            {
+                ExpandInstanceReference(file, objectById, partObject, nestedReference, composedTransform, result, depth + 1);
+                continue;
+            }
+
+            result.Add(CreateBimObject(file, partObject, MergeAttributes(instanceObject.Attributes, partObject.Attributes), partObject.Geometry, composedTransform, instanceObject));
+        }
+    }
+
+    private static RhinoBimObject CreateBimObject(
+        File3dm file,
+        File3dmObject fileObject,
+        ObjectAttributes attributes,
+        GeometryBase geometry,
+        Transform transform,
+        File3dmObject? instanceObject)
+    {
+        var layerName = ResolveLayerName(file, attributes.LayerIndex);
+        var name = FirstNonEmpty(attributes.Name, fileObject.Name, instanceObject?.Name, fileObject.Id.ToString());
+        var copiedGeometry = geometry.Duplicate();
+        if (!transform.IsIdentity)
+        {
+            copiedGeometry.Transform(transform);
+        }
+
+        var userText = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (instanceObject?.Attributes is not null)
+        {
+            AddUserStrings(userText, instanceObject.Attributes.GetUserStrings());
+        }
+
+        AddUserStrings(userText, attributes.GetUserStrings());
+        AddUserStrings(userText, copiedGeometry.GetUserStrings());
+
+        return new RhinoBimObject
+        {
+            RhinoObjectId = instanceObject?.Id ?? fileObject.Id,
+            ObjectName = name,
+            LayerName = layerName,
+            GeometryType = copiedGeometry.GetType().Name,
+            UserText = userText,
+            Geometry = copiedGeometry
+        };
+    }
+
+    private static ObjectAttributes MergeAttributes(ObjectAttributes instanceAttributes, ObjectAttributes partAttributes)
+    {
+        var merged = partAttributes.Duplicate();
+        if (string.IsNullOrWhiteSpace(merged.Name))
+        {
+            merged.Name = instanceAttributes.Name;
+        }
+
+        if (merged.LayerIndex < 0)
+        {
+            merged.LayerIndex = instanceAttributes.LayerIndex;
+        }
+
+        foreach (var key in instanceAttributes.GetUserStrings()?.AllKeys ?? [])
+        {
+            if (!string.IsNullOrWhiteSpace(key) && string.IsNullOrWhiteSpace(merged.GetUserString(key)))
+            {
+                merged.SetUserString(key, instanceAttributes.GetUserString(key));
+            }
+        }
+
+        return merged;
     }
 
     private static string ResolveLayerName(File3dm file, int layerIndex)
@@ -56,14 +159,6 @@ public sealed class ThreeDmReader
         }
 
         return string.Empty;
-    }
-
-    private static Dictionary<string, string> ReadUserText(Rhino.DocObjects.ObjectAttributes attributes, GeometryBase geometry)
-    {
-        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        AddUserStrings(values, attributes.GetUserStrings());
-        AddUserStrings(values, geometry.GetUserStrings());
-        return values;
     }
 
     private static void AddUserStrings(Dictionary<string, string> values, System.Collections.Specialized.NameValueCollection? userStrings)

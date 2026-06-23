@@ -42,9 +42,13 @@ public sealed class ObjectClassificationService
             obj.IfcMaterial = GetUserText(obj, "IfcMaterial", string.Empty);
             obj.IfcPropertySetsJson = GetUserText(obj, "IfcPropertySetsJson", string.Empty);
             obj.IfcFullDataJson = GetUserText(obj, "IfcFullDataJson", string.Empty);
-            obj.IsSupportedGeometry = obj.Geometry is Mesh;
+            obj.IsSupportedGeometry = obj.Geometry is Mesh or Brep or Extrusion or LineCurve;
 
             if (obj.Geometry is Mesh)
+            {
+                summary.MeshObjects++;
+            }
+            else if (obj.Geometry is Brep or Extrusion or LineCurve)
             {
                 summary.MeshObjects++;
             }

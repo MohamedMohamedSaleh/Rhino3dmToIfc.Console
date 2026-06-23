@@ -12,6 +12,7 @@ using Xbim.Ifc4.Interfaces;
 using Xbim.Ifc4.Kernel;
 using Xbim.Ifc4.MaterialResource;
 using Xbim.Ifc4.MeasureResource;
+using Xbim.Ifc4.PresentationOrganizationResource;
 using Xbim.Ifc4.ProductExtension;
 using Xbim.Ifc4.RepresentationResource;
 using Xbim.Ifc4.SharedBldgElements;
@@ -62,6 +63,8 @@ public sealed class IfcModelBuilder
 
             var storeys = new Dictionary<string, IfcBuildingStorey>(StringComparer.OrdinalIgnoreCase);
             var materials = new Dictionary<string, IfcMaterial>(StringComparer.OrdinalIgnoreCase);
+            var layers = new Dictionary<string, IfcPresentationLayerAssignment>(StringComparer.OrdinalIgnoreCase);
+            var layerGroups = new Dictionary<string, IfcRelAssignsToGroup>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var source in objects)
             {
@@ -76,7 +79,7 @@ public sealed class IfcModelBuilder
                     var product = CreateProduct(model, ownerHistory, source);
                     product.ObjectPlacement = CreateLocalPlacement(model);
 
-                    if (!_geometryBuilder.TryAttachMeshRepresentation(product, source, context, out var skipReason))
+                    if (!_geometryBuilder.TryAttachMeshRepresentation(product, source, context, layers, out var skipReason))
                     {
                         source.SkipReason = skipReason;
                         summary.SkippedObjects++;
@@ -87,6 +90,7 @@ public sealed class IfcModelBuilder
                     Contain(model, ownerHistory, storey, product);
                     AssociateMaterial(model, ownerHistory, product, source.IfcMaterial, materials);
                     _propertySetBuilder.AttachPropertySets(product, source, summary);
+                    AssignProductToLayerGroup(model, ownerHistory, product, source.LayerName, layerGroups);
 
                     summary.ExportedObjects++;
                     _log.Info($"Exported {source.RhinoObjectId} as {source.IfcType} '{source.IfcName}'.");
@@ -273,6 +277,34 @@ public sealed class IfcModelBuilder
         relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
         relation.OwnerHistory = ownerHistory;
         relation.RelatingMaterial = material;
+        relation.RelatedObjects.Add(product);
+    }
+
+    private static void AssignProductToLayerGroup(
+        IfcStore model,
+        IfcOwnerHistory ownerHistory,
+        IfcProduct product,
+        string layerName,
+        Dictionary<string, IfcRelAssignsToGroup> layerGroups)
+    {
+        var normalizedLayerName = string.IsNullOrWhiteSpace(layerName) ? "Default" : layerName.Trim();
+        if (!layerGroups.TryGetValue(normalizedLayerName, out var relation))
+        {
+            var group = model.Instances.New<IfcGroup>();
+            group.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+            group.OwnerHistory = ownerHistory;
+            group.Name = normalizedLayerName;
+            group.Description = $"Rhino layer: {normalizedLayerName}";
+            group.ObjectType = "Rhino Layer";
+
+            relation = model.Instances.New<IfcRelAssignsToGroup>();
+            relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+            relation.OwnerHistory = ownerHistory;
+            relation.Name = $"Products on Rhino layer {normalizedLayerName}";
+            relation.RelatingGroup = group;
+            layerGroups[normalizedLayerName] = relation;
+        }
+
         relation.RelatedObjects.Add(product);
     }
 

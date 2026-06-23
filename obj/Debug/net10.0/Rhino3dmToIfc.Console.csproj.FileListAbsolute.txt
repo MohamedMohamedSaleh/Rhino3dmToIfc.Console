@@ -35,3 +35,4 @@
 /Users/mohamedsaleh/dotnet/Rhino3dmToIfc/Rhino3dmToIfc.Console/obj/Debug/net10.0/Rhino3dmToIfc.Console.pdb
 /Users/mohamedsaleh/dotnet/Rhino3dmToIfc/Rhino3dmToIfc.Console/obj/Debug/net10.0/Rhino3dmToIfc.Console.genruntimeconfig.cache
 /Users/mohamedsaleh/dotnet/Rhino3dmToIfc/Rhino3dmToIfc.Console/obj/Debug/net10.0/ref/Rhino3dmToIfc.Console.dll
+/Users/mohamedsaleh/dotnet/Rhino3dmToIfc/Rhino3dmToIfc.Console/obj/Debug/net10.0/Rhino3dmToIfc.Console.sourcelink.json

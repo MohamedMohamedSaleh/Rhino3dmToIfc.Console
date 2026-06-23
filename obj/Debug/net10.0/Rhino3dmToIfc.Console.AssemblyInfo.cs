@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("Rhino3dmToIfc.Console")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+8504f9f907718709a0a6adc436fbc8f1b2bf2af1")]
 [assembly: System.Reflection.AssemblyProductAttribute("Rhino3dmToIfc.Console")]
 [assembly: System.Reflection.AssemblyTitleAttribute("Rhino3dmToIfc.Console")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
