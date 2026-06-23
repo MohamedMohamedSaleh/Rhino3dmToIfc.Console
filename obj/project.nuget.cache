@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "dgSpecHash": "eN7Bfb6Wzz8=",
+  "success": true,
+  "projectFilePath": "/Users/mohamedsaleh/dotnet/Rhino3dmToIfc/Rhino3dmToIfc.Console/Rhino3dmToIfc.Console.csproj",
+  "expectedPackageFiles": [
+    "/Users/mohamedsaleh/.nuget/packages/microsoft.database.managedesent/2.0.3/microsoft.database.managedesent.2.0.3.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/microsoft.extensions.dependencyinjection/8.0.0/microsoft.extensions.dependencyinjection.8.0.0.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/microsoft.extensions.dependencyinjection.abstractions/9.0.3/microsoft.extensions.dependencyinjection.abstractions.9.0.3.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/microsoft.extensions.logging.abstractions/8.0.0/microsoft.extensions.logging.abstractions.8.0.0.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/microsoft.extensions.options/9.0.3/microsoft.extensions.options.9.0.3.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/microsoft.extensions.primitives/9.0.3/microsoft.extensions.primitives.9.0.3.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/newtonsoft.json/13.0.4/newtonsoft.json.13.0.4.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/rhino3dm/8.17.0/rhino3dm.8.17.0.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/xbim.common/6.0.587/xbim.common.6.0.587.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/xbim.essentials/6.0.587/xbim.essentials.6.0.587.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/xbim.ifc/6.0.587/xbim.ifc.6.0.587.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/xbim.ifc2x3/6.0.587/xbim.ifc2x3.6.0.587.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/xbim.ifc4/6.0.587/xbim.ifc4.6.0.587.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/xbim.ifc4x3/6.0.587/xbim.ifc4x3.6.0.587.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/xbim.io.esent/6.0.587/xbim.io.esent.6.0.587.nupkg.sha512",
+    "/Users/mohamedsaleh/.nuget/packages/xbim.io.memorymodel/6.0.587/xbim.io.memorymodel.6.0.587.nupkg.sha512"
+  ],
+  "logs": []
+}
