@@ -34,13 +34,7 @@ public sealed class IfcGeometryBuilder
 
         if (source.Geometry is Brep brep)
         {
-            var savedBrepMesh = ExtractBrepMesh(brep);
-            if (savedBrepMesh is null)
-            {
-                return TryAttachBrepPolygonalRepresentation(product, source, brep, context, layers, out skipReason);
-            }
-
-            return TryAttachMesh(product, source, savedBrepMesh, context, layers, out skipReason);
+            return TryAttachBrepPreferredRepresentation(product, source, brep, context, layers, out skipReason);
         }
 
         if (source.Geometry is Surface surface)
@@ -48,13 +42,7 @@ public sealed class IfcGeometryBuilder
             var surfaceBrep = surface.ToBrep();
             if (surfaceBrep is not null)
             {
-                var surfaceMesh = ExtractBrepMesh(surfaceBrep);
-                if (surfaceMesh is not null)
-                {
-                    return TryAttachMesh(product, source, surfaceMesh, context, layers, out skipReason);
-                }
-
-                return TryAttachBrepPolygonalRepresentation(product, source, surfaceBrep, context, layers, out skipReason);
+                return TryAttachBrepPreferredRepresentation(product, source, surfaceBrep, context, layers, out skipReason);
             }
         }
 
@@ -72,6 +60,31 @@ public sealed class IfcGeometryBuilder
         }
 
         return TryAttachMesh(product, source, mesh, context, layers, out skipReason);
+    }
+
+    private bool TryAttachBrepPreferredRepresentation(
+        IfcProduct product,
+        RhinoBimObject source,
+        Brep brep,
+        IfcGeometricRepresentationContext context,
+        IDictionary<string, IfcPresentationLayerAssignment> layers,
+        out string skipReason)
+    {
+        if (TryAttachBrepPolygonalRepresentation(product, source, brep, context, layers, false, out skipReason))
+        {
+            return true;
+        }
+
+        var polygonalSkipReason = skipReason;
+        var fallbackMesh = ExtractBrepMesh(brep);
+        if (fallbackMesh is not null && TryAttachMesh(product, source, fallbackMesh, context, layers, out skipReason))
+        {
+            return true;
+        }
+
+        skipReason = string.IsNullOrWhiteSpace(skipReason) ? polygonalSkipReason : $"{polygonalSkipReason} Mesh fallback also failed: {skipReason}";
+        _log.Warning($"Skipping {source.RhinoObjectId}: {skipReason}");
+        return false;
     }
 
     private bool TryAttachMesh(
@@ -148,6 +161,7 @@ public sealed class IfcGeometryBuilder
         Brep brep,
         IfcGeometricRepresentationContext context,
         IDictionary<string, IfcPresentationLayerAssignment> layers,
+        bool logFailure,
         out string skipReason)
     {
         skipReason = string.Empty;
@@ -196,7 +210,11 @@ public sealed class IfcGeometryBuilder
         if (faceSet.Faces.Count == 0)
         {
             skipReason = "Brep has no exportable polygonal faces.";
-            _log.Warning($"Skipping {source.RhinoObjectId}: {skipReason}");
+            if (logFailure)
+            {
+                _log.Warning($"Skipping {source.RhinoObjectId}: {skipReason}");
+            }
+
             return false;
         }
 
