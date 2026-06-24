@@ -27,14 +27,14 @@ public sealed class IfcGeometryBuilder
     {
         skipReason = string.Empty;
 
-        if (source.Geometry is LineCurve lineCurve)
+        if (source.Geometry is Curve curve)
         {
-            return TryAttachLineRepresentation(product, source, lineCurve, context, layers, out skipReason);
+            return TryAttachCurveRepresentation(product, source, curve, context, layers, out skipReason);
         }
 
         if (source.Geometry is Brep brep)
         {
-            var savedBrepMesh = ExtractSavedBrepMesh(brep);
+            var savedBrepMesh = ExtractBrepMesh(brep);
             if (savedBrepMesh is null)
             {
                 return TryAttachBrepPolygonalRepresentation(product, source, brep, context, layers, out skipReason);
@@ -43,13 +43,29 @@ public sealed class IfcGeometryBuilder
             return TryAttachMesh(product, source, savedBrepMesh, context, layers, out skipReason);
         }
 
+        if (source.Geometry is Surface surface)
+        {
+            var surfaceBrep = surface.ToBrep();
+            if (surfaceBrep is not null)
+            {
+                var surfaceMesh = ExtractBrepMesh(surfaceBrep);
+                if (surfaceMesh is not null)
+                {
+                    return TryAttachMesh(product, source, surfaceMesh, context, layers, out skipReason);
+                }
+
+                return TryAttachBrepPolygonalRepresentation(product, source, surfaceBrep, context, layers, out skipReason);
+            }
+        }
+
         var mesh = ExtractMesh(source.Geometry);
         if (mesh is null)
         {
             skipReason = source.Geometry switch
             {
-                Extrusion => "Extrusion has no saved render/preview/analysis mesh in the 3DM file. Save render meshes in Rhino or export/convert to Mesh before running this converter.",
-                _ => source.SkipReason
+                Extrusion => "Extrusion has no saved render/preview/analysis mesh and could not be converted to Brep topology.",
+                Surface => "Surface could not be converted to Brep or mesh geometry.",
+                _ => string.IsNullOrWhiteSpace(source.SkipReason) ? "Geometry could not be converted to an IFC representation." : source.SkipReason
             };
             _log.Warning($"Skipping {source.RhinoObjectId}: {skipReason}");
             return false;
@@ -75,9 +91,10 @@ public sealed class IfcGeometryBuilder
             return false;
         }
 
+        var exportMesh = PrepareMeshForExport(mesh);
         var model = product.Model;
         var pointList = model.Instances.New<IfcCartesianPointList3D>();
-        foreach (var vertex in mesh.Vertices)
+        foreach (var vertex in exportMesh.Vertices)
         {
             var coords = pointList.CoordList.GetAt(pointList.CoordList.Count);
             coords.Add(new IfcLengthMeasure(vertex.X));
@@ -87,10 +104,10 @@ public sealed class IfcGeometryBuilder
 
         var faceSet = model.Instances.New<IfcTriangulatedFaceSet>();
         faceSet.Coordinates = pointList;
-        faceSet.Closed = mesh.IsClosed;
+        faceSet.Closed = exportMesh.IsClosed;
 
         var triangleCount = 0;
-        foreach (var face in mesh.Faces)
+        foreach (var face in exportMesh.Faces)
         {
             if (face.IsTriangle)
             {
@@ -136,6 +153,7 @@ public sealed class IfcGeometryBuilder
         skipReason = string.Empty;
         var model = product.Model;
         var pointList = model.Instances.New<IfcCartesianPointList3D>();
+        var pointIndex = new Dictionary<PointKey, int>();
         var faceSet = model.Instances.New<IfcPolygonalFaceSet>();
         faceSet.Coordinates = pointList;
         faceSet.Closed = brep.IsSolid;
@@ -157,18 +175,18 @@ public sealed class IfcGeometryBuilder
             if (projectedLoops.Count == 1)
             {
                 var polygonalFace = model.Instances.New<IfcIndexedPolygonalFace>();
-                AddPolygonLoop(pointList, polygonalFace.CoordIndex, projectedLoops[0]);
+                AddPolygonLoop(pointList, pointIndex, polygonalFace.CoordIndex, projectedLoops[0]);
                 faceSet.Faces.Add(polygonalFace);
             }
             else
             {
                 var polygonalFace = model.Instances.New<IfcIndexedPolygonalFaceWithVoids>();
-                AddPolygonLoop(pointList, polygonalFace.CoordIndex, projectedLoops[0]);
+                AddPolygonLoop(pointList, pointIndex, polygonalFace.CoordIndex, projectedLoops[0]);
 
                 for (var i = 1; i < projectedLoops.Count; i++)
                 {
                     var inner = polygonalFace.InnerCoordIndices.GetAt(polygonalFace.InnerCoordIndices.Count);
-                    AddPolygonLoop(pointList, inner, projectedLoops[i]);
+                    AddPolygonLoop(pointList, pointIndex, inner, projectedLoops[i]);
                 }
 
                 faceSet.Faces.Add(polygonalFace);
@@ -195,45 +213,44 @@ public sealed class IfcGeometryBuilder
         return true;
     }
 
-    private static void AddPolygonLoop(IfcCartesianPointList3D pointList, Xbim.Common.IItemSet<IfcPositiveInteger> target, List<ProjectedPoint> loop)
+    private static void AddPolygonLoop(
+        IfcCartesianPointList3D pointList,
+        Dictionary<PointKey, int> pointIndex,
+        Xbim.Common.IItemSet<IfcPositiveInteger> target,
+        List<ProjectedPoint> loop)
     {
         foreach (var projectedPoint in loop)
         {
-            var coords = pointList.CoordList.GetAt(pointList.CoordList.Count);
-            coords.Add(new IfcLengthMeasure(projectedPoint.Point.X));
-            coords.Add(new IfcLengthMeasure(projectedPoint.Point.Y));
-            coords.Add(new IfcLengthMeasure(projectedPoint.Point.Z));
-            target.Add(new IfcPositiveInteger(pointList.CoordList.Count));
+            target.Add(new IfcPositiveInteger(GetOrAddPointIndex(pointList, pointIndex, projectedPoint.Point)));
         }
     }
 
-    private bool TryAttachLineRepresentation(
+    private bool TryAttachCurveRepresentation(
         IfcProduct product,
         RhinoBimObject source,
-        LineCurve lineCurve,
+        Curve curve,
         IfcGeometricRepresentationContext context,
         IDictionary<string, IfcPresentationLayerAssignment> layers,
         out string skipReason)
     {
         skipReason = string.Empty;
-        var line = lineCurve.Line;
-        if (!line.IsValid || line.Length <= 0)
+        var points = GetCurvePolylinePoints(curve);
+        if (points.Count < 2)
         {
-            skipReason = "LineCurve is invalid or has zero length.";
+            skipReason = "Curve is invalid or has fewer than two exportable points.";
             _log.Warning($"Skipping {source.RhinoObjectId}: {skipReason}");
             return false;
         }
 
         var model = product.Model;
-        var start = model.Instances.New<IfcCartesianPoint>();
-        start.SetXYZ(line.FromX, line.FromY, line.FromZ);
-
-        var end = model.Instances.New<IfcCartesianPoint>();
-        end.SetXYZ(line.ToX, line.ToY, line.ToZ);
-
         var polyline = model.Instances.New<IfcPolyline>();
-        polyline.Points.Add(start);
-        polyline.Points.Add(end);
+        foreach (var point in points)
+        {
+            var ifcPoint = model.Instances.New<IfcCartesianPoint>();
+            ifcPoint.SetXYZ(point.X, point.Y, point.Z);
+            polyline.Points.Add(ifcPoint);
+        }
+
         AssignToLayers(polyline, source, layers);
 
         var shapeRepresentation = model.Instances.New<IfcShapeRepresentation>();
@@ -317,23 +334,38 @@ public sealed class IfcGeometryBuilder
         indices.Add(new IfcPositiveInteger(c + 1));
     }
 
+    private static Mesh PrepareMeshForExport(Mesh mesh)
+    {
+        var exportMesh = mesh.DuplicateMesh();
+        exportMesh.Faces.ConvertQuadsToTriangles();
+        exportMesh.Vertices.CombineIdentical(true, true);
+        exportMesh.Vertices.CullUnused();
+        exportMesh.Compact();
+        return exportMesh;
+    }
+
     private static Mesh? ExtractMesh(object? geometry)
     {
         return geometry switch
         {
-            Mesh mesh => mesh,
+            Mesh mesh => DuplicateMesh(mesh),
             Extrusion extrusion => DuplicateMesh(GetFirstMesh(
                 () => extrusion.GetMesh(MeshType.Render),
                 () => extrusion.GetMesh(MeshType.Preview),
                 () => extrusion.GetMesh(MeshType.Analysis),
                 () => extrusion.GetMesh(MeshType.Any),
-                () => extrusion.GetMesh(MeshType.Default))),
+                () => extrusion.GetMesh(MeshType.Default))) ?? ExtractBrepMesh(extrusion.ToBrep()),
             _ => null
         };
     }
 
-    private static Mesh? ExtractSavedBrepMesh(Brep brep)
+    private static Mesh? ExtractBrepMesh(Brep? brep)
     {
+        if (brep is null)
+        {
+            return null;
+        }
+
         var meshes = new List<Mesh>();
         foreach (var face in brep.Faces)
         {
@@ -358,6 +390,9 @@ public sealed class IfcGeometryBuilder
 
         var combined = new Mesh();
         combined.Append(meshes);
+        combined.Faces.ConvertQuadsToTriangles();
+        combined.Vertices.CombineIdentical(true, true);
+        combined.Vertices.CullUnused();
         combined.Compact();
         return combined;
     }
@@ -516,6 +551,72 @@ public sealed class IfcGeometryBuilder
         RemoveClosingDuplicate(sampled);
         RemoveCollinear(sampled);
         return sampled.Count >= 3 ? sampled : [];
+    }
+
+    private static List<Point3d> GetCurvePolylinePoints(Curve curve)
+    {
+        if (!curve.IsValid)
+        {
+            return [];
+        }
+
+        if (curve.TryGetPolyline(out var polyline) && polyline.Count >= 2)
+        {
+            return CleanPolylinePoints(polyline);
+        }
+
+        if (curve is LineCurve lineCurve)
+        {
+            return CleanPolylinePoints([lineCurve.Line.From, lineCurve.Line.To]);
+        }
+
+        var domain = curve.Domain;
+        if (domain.T1 <= domain.T0)
+        {
+            return [];
+        }
+
+        const int segmentCount = 48;
+        var points = new List<Point3d>();
+        for (var i = 0; i <= segmentCount; i++)
+        {
+            var t = domain.T0 + ((domain.T1 - domain.T0) * i / segmentCount);
+            points.Add(curve.PointAt(t));
+        }
+
+        return CleanPolylinePoints(points);
+    }
+
+    private static List<Point3d> CleanPolylinePoints(IEnumerable<Point3d> source)
+    {
+        var points = new List<Point3d>();
+        foreach (var point in source)
+        {
+            AddDistinctPoint(points, point);
+        }
+
+        return points;
+    }
+
+    private static int GetOrAddPointIndex(
+        IfcCartesianPointList3D pointList,
+        Dictionary<PointKey, int> pointIndex,
+        Point3d point)
+    {
+        var key = PointKey.From(point);
+        if (pointIndex.TryGetValue(key, out var existing))
+        {
+            return existing;
+        }
+
+        var coords = pointList.CoordList.GetAt(pointList.CoordList.Count);
+        coords.Add(new IfcLengthMeasure(point.X));
+        coords.Add(new IfcLengthMeasure(point.Y));
+        coords.Add(new IfcLengthMeasure(point.Z));
+
+        var index = pointList.CoordList.Count;
+        pointIndex[key] = index;
+        return index;
     }
 
     private static List<List<ProjectedPoint>> ProjectLoops(List<List<Point3d>> loops)
@@ -875,6 +976,18 @@ public sealed class IfcGeometryBuilder
     }
 
     private sealed record ProjectedPoint(Point3d Point, double X, double Y);
+
+    private readonly record struct PointKey(long X, long Y, long Z)
+    {
+        public static PointKey From(Point3d point)
+        {
+            const double scale = 1_000_000.0;
+            return new PointKey(
+                (long)Math.Round(point.X * scale),
+                (long)Math.Round(point.Y * scale),
+                (long)Math.Round(point.Z * scale));
+        }
+    }
 
     private readonly record struct TriangleIndex(int A, int B, int C);
 }

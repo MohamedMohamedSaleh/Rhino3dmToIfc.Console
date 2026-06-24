@@ -93,3 +93,8 @@ static void PrintSummary(ExportSummary summary)
     System.Console.WriteLine($"IFC output:          {summary.OutputPath}");
     System.Console.WriteLine($"Log file:            {summary.LogPath}");
 }
+
+
+// dotnet run -- --input "1574_all panels_fabrication.3dm" --output "model_success2.ifc" --default-storey "Level 1" --default-ifc-type "IfcBuildingElementProxy"
+// dotnet run -- --input "1653_all panels_fabrication_failed.3dm" --output "model_faild.ifc" --default-storey "Level 1" --default-ifc-type "IfcBuildingElementProxy"
+// dotnet run -- --input "1597_all panels_fabrication.3dm" --output "model_success.ifc" --default-storey "Level 1" --default-ifc-type "IfcBuildingElementProxy"

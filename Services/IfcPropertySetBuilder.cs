@@ -1,4 +1,5 @@
 using Newtonsoft.Json.Linq;
+using Rhino.Geometry;
 using Rhino3dmToIfc.Console.Models;
 using Xbim.Ifc4.Kernel;
 using Xbim.Ifc4.MeasureResource;
@@ -23,10 +24,12 @@ public sealed class IfcPropertySetBuilder
         {
             ["SourceRhinoObjectId"] = source.RhinoObjectId.ToString(),
             ["SourceLayer"] = source.LayerName,
+            ["SourceAdditionalLayers"] = string.Join("; ", source.AdditionalLayerNames),
             ["SourceGeometryType"] = source.GeometryType,
             ["ExportedBy"] = "Rhino3dmToIfc.Console",
             ["ExportedAtUtc"] = DateTimeOffset.UtcNow.ToString("O")
         };
+        AddGeometryProperties(sourceProperties, source.Geometry);
 
         AttachPropertySet(product, "Pset_RhinoSource", sourceProperties);
 
@@ -83,6 +86,52 @@ public sealed class IfcPropertySetBuilder
         relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
         relation.RelatingPropertyDefinition = propertySet;
         relation.RelatedObjects.Add(product);
+    }
+
+    private static void AddGeometryProperties(Dictionary<string, object?> target, object? geometry)
+    {
+        if (geometry is not GeometryBase geometryBase)
+        {
+            return;
+        }
+
+        var bounds = geometryBase.GetBoundingBox(true);
+        if (bounds.IsValid)
+        {
+            target["BoundingBoxMinX"] = bounds.Min.X;
+            target["BoundingBoxMinY"] = bounds.Min.Y;
+            target["BoundingBoxMinZ"] = bounds.Min.Z;
+            target["BoundingBoxMaxX"] = bounds.Max.X;
+            target["BoundingBoxMaxY"] = bounds.Max.Y;
+            target["BoundingBoxMaxZ"] = bounds.Max.Z;
+            target["ApproxWidthX"] = bounds.Max.X - bounds.Min.X;
+            target["ApproxDepthY"] = bounds.Max.Y - bounds.Min.Y;
+            target["ApproxHeightZ"] = bounds.Max.Z - bounds.Min.Z;
+        }
+
+        switch (geometry)
+        {
+            case Mesh mesh:
+                target["MeshVertexCount"] = mesh.Vertices.Count;
+                target["MeshFaceCount"] = mesh.Faces.Count;
+                target["MeshIsClosed"] = mesh.IsClosed;
+                break;
+            case Brep brep:
+                target["BrepFaceCount"] = brep.Faces.Count;
+                target["BrepEdgeCount"] = brep.Edges.Count;
+                target["BrepIsSolid"] = brep.IsSolid;
+                break;
+            case Extrusion extrusion:
+                target["ExtrusionIsSolid"] = extrusion.IsSolid;
+                break;
+            case Curve curve:
+                target["CurveIsClosed"] = curve.IsClosed;
+                break;
+            case Surface surface:
+                target["SurfaceIsClosedU"] = surface.IsClosed(0);
+                target["SurfaceIsClosedV"] = surface.IsClosed(1);
+                break;
+        }
     }
 
     private static bool IsSupportedValue(JToken token)

@@ -24,6 +24,8 @@ public sealed class ThreeDmReader
         var objectById = file.Objects
             .Where(fileObject => fileObject.HasId)
             .ToDictionary(fileObject => fileObject.Id);
+        var definitionById = file.AllInstanceDefinitions.ToDictionary(definition => definition.Id);
+        var layerNameByIndex = file.AllLayers.ToDictionary(layer => layer.Index, layer => FirstNonEmpty(layer.FullPath, layer.Name, $"Layer {layer.Index}"));
 
         foreach (var fileObject in file.Objects)
         {
@@ -39,11 +41,11 @@ public sealed class ThreeDmReader
 
             if (fileObject.Geometry is InstanceReferenceGeometry instanceReference)
             {
-                ExpandInstanceReference(file, objectById, fileObject, instanceReference, Transform.Identity, result, 0);
+                ExpandInstanceReference(definitionById, objectById, layerNameByIndex, fileObject, instanceReference, Transform.Identity, result, 0);
                 continue;
             }
 
-            result.Add(CreateBimObject(file, fileObject, fileObject.Attributes, fileObject.Geometry, Transform.Identity, null));
+            result.Add(CreateBimObject(layerNameByIndex, fileObject, fileObject.Attributes, fileObject.Geometry, Transform.Identity, null));
         }
 
         _log.Info($"Read {result.Count} non-deleted objects from 3DM.");
@@ -62,8 +64,9 @@ public sealed class ThreeDmReader
     }
 
     private void ExpandInstanceReference(
-        File3dm file,
+        IReadOnlyDictionary<Guid, InstanceDefinitionGeometry> definitionById,
         IReadOnlyDictionary<Guid, File3dmObject> objectById,
+        IReadOnlyDictionary<int, string> layerNameByIndex,
         File3dmObject instanceObject,
         InstanceReferenceGeometry instanceReference,
         Transform parentTransform,
@@ -76,8 +79,7 @@ public sealed class ThreeDmReader
             return;
         }
 
-        var definition = file.AllInstanceDefinitions.FirstOrDefault(candidate => candidate.Id == instanceReference.ParentIdefId);
-        if (definition is null)
+        if (!definitionById.TryGetValue(instanceReference.ParentIdefId, out var definition))
         {
             _log.Warning($"Skipping instance {instanceObject.Id}: instance definition {instanceReference.ParentIdefId} was not found.");
             return;
@@ -93,24 +95,24 @@ public sealed class ThreeDmReader
 
             if (partObject.Geometry is InstanceReferenceGeometry nestedReference)
             {
-                ExpandInstanceReference(file, objectById, partObject, nestedReference, composedTransform, result, depth + 1);
+                ExpandInstanceReference(definitionById, objectById, layerNameByIndex, partObject, nestedReference, composedTransform, result, depth + 1);
                 continue;
             }
 
-            result.Add(CreateBimObject(file, partObject, MergeAttributes(instanceObject.Attributes, partObject.Attributes), partObject.Geometry, composedTransform, instanceObject));
+            result.Add(CreateBimObject(layerNameByIndex, partObject, MergeAttributes(instanceObject.Attributes, partObject.Attributes), partObject.Geometry, composedTransform, instanceObject));
         }
     }
 
     private static RhinoBimObject CreateBimObject(
-        File3dm file,
+        IReadOnlyDictionary<int, string> layerNameByIndex,
         File3dmObject fileObject,
         ObjectAttributes attributes,
         GeometryBase geometry,
         Transform transform,
         File3dmObject? instanceObject)
     {
-        var definitionLayerName = ResolveLayerName(file, attributes.LayerIndex);
-        var instanceLayerName = instanceObject?.Attributes is null ? string.Empty : ResolveLayerName(file, instanceObject.Attributes.LayerIndex);
+        var definitionLayerName = ResolveLayerName(layerNameByIndex, attributes.LayerIndex);
+        var instanceLayerName = instanceObject?.Attributes is null ? string.Empty : ResolveLayerName(layerNameByIndex, instanceObject.Attributes.LayerIndex);
         var layerName = FirstNonEmpty(instanceLayerName, definitionLayerName);
         var name = FirstNonEmpty(attributes.Name, fileObject.Name, instanceObject?.Name, fileObject.Id.ToString());
         var copiedGeometry = geometry.Duplicate();
@@ -175,15 +177,11 @@ public sealed class ThreeDmReader
         return merged;
     }
 
-    private static string ResolveLayerName(File3dm file, int layerIndex)
+    private static string ResolveLayerName(IReadOnlyDictionary<int, string> layerNameByIndex, int layerIndex)
     {
-        if (layerIndex >= 0)
+        if (layerIndex >= 0 && layerNameByIndex.TryGetValue(layerIndex, out var layerName))
         {
-            var layer = file.AllLayers.FirstOrDefault(candidate => candidate.Index == layerIndex);
-            if (layer is not null)
-            {
-                return FirstNonEmpty(layer.FullPath, layer.Name, $"Layer {layerIndex}");
-            }
+            return layerName;
         }
 
         return string.Empty;

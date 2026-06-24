@@ -42,13 +42,13 @@ public sealed class ObjectClassificationService
             obj.IfcMaterial = GetUserText(obj, "IfcMaterial", string.Empty);
             obj.IfcPropertySetsJson = GetUserText(obj, "IfcPropertySetsJson", string.Empty);
             obj.IfcFullDataJson = GetUserText(obj, "IfcFullDataJson", string.Empty);
-            obj.IsSupportedGeometry = obj.Geometry is Mesh or Brep or Extrusion or LineCurve;
+            obj.IsSupportedGeometry = obj.Geometry is Mesh or Brep or Extrusion or Surface or Curve;
 
             if (obj.Geometry is Mesh)
             {
                 summary.MeshObjects++;
             }
-            else if (obj.Geometry is Brep or Extrusion or LineCurve)
+            else if (obj.Geometry is Brep or Extrusion or Surface or Curve)
             {
                 summary.MeshObjects++;
             }
@@ -160,10 +160,10 @@ public sealed class ObjectClassificationService
     {
         return geometryType switch
         {
-            "Brep" => "Brep geometry is not supported in Version 1. Brep meshing requires Rhino or Rhino Compute in Version 2.",
-            "Surface" => "Surface geometry is not supported in Version 1. Surface meshing requires Rhino or Rhino Compute in Version 2.",
-            "Extrusion" => "Extrusion geometry is not supported in Version 1. Extrusion meshing requires Rhino or Rhino Compute in Version 2.",
-            "Curve" => "Curve geometry is not supported in Version 1.",
+            "Brep" => "Brep geometry could not be converted to an exportable tessellation.",
+            "Surface" => "Surface geometry could not be converted to an exportable tessellation.",
+            "Extrusion" => "Extrusion geometry could not be converted to an exportable tessellation.",
+            "Curve" => "Curve geometry could not be converted to an exportable IFC polyline.",
             _ => $"{geometryType} geometry is not supported in Version 1."
         };
     }
