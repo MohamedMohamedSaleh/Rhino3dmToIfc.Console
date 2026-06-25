@@ -40,10 +40,10 @@ public sealed class ObjectClassificationService
             obj.IfcPredefinedType = GetUserText(obj, "IfcPredefinedType", classification.PredefinedType);
             obj.IfcObjectType = GetUserText(obj, "IfcObjectType", classification.ObjectType);
             obj.IfcGlobalId = ResolveGlobalId(obj);
-            obj.IfcName = GetUserText(obj, "IfcName", obj.ObjectName);
+            obj.IfcName = GetUserText(obj, "IfcName", GetFirstUserText(obj, obj.ObjectName, "Panel_Name", "Panel Name", "Part_ID", "Part ID"));
             obj.IfcDescription = GetUserText(obj, "IfcDescription", string.Empty);
             obj.IfcStorey = GetUserText(obj, "IfcStorey", options.DefaultStorey);
-            obj.IfcMaterial = GetUserText(obj, "IfcMaterial", obj.RhinoMaterialName);
+            obj.IfcMaterial = GetUserText(obj, "IfcMaterial", GetFirstUserText(obj, obj.RhinoMaterialName, "Material"));
             obj.IfcPropertySetsJson = GetUserText(obj, "IfcPropertySetsJson", string.Empty);
             obj.IfcFullDataJson = GetUserText(obj, "IfcFullDataJson", string.Empty);
             obj.IsSupportedGeometry = obj.Geometry is Mesh or Brep or Extrusion or Surface or Curve;
@@ -157,6 +157,19 @@ public sealed class ObjectClassificationService
         return obj.UserText.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
             ? value.Trim()
             : fallback;
+    }
+
+    private static string GetFirstUserText(RhinoBimObject obj, string fallback, params string[] keys)
+    {
+        foreach (var key in keys)
+        {
+            if (obj.UserText.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value))
+            {
+                return value.Trim();
+            }
+        }
+
+        return fallback;
     }
 
     private static string NormalizeIfcType(string value)
