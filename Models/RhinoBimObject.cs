@@ -16,6 +16,18 @@ public sealed class RhinoBimObject
 
     public object? Geometry { get; set; }
 
+    public string RhinoMaterialName { get; set; } = string.Empty;
+
+    public string DisplayColorName { get; set; } = string.Empty;
+
+    public byte? DisplayColorRed { get; set; }
+
+    public byte? DisplayColorGreen { get; set; }
+
+    public byte? DisplayColorBlue { get; set; }
+
+    public double? DisplayTransparency { get; set; }
+
     public string IfcGlobalId { get; set; } = string.Empty;
 
     public string IfcType { get; set; } = string.Empty;

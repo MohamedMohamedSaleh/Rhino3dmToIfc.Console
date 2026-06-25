@@ -2,6 +2,7 @@ using Rhino.FileIO;
 using Rhino.DocObjects;
 using Rhino.Geometry;
 using Rhino3dmToIfc.Console.Models;
+using System.Drawing;
 
 namespace Rhino3dmToIfc.Console.Services;
 
@@ -25,7 +26,10 @@ public sealed class ThreeDmReader
             .Where(fileObject => fileObject.HasId)
             .ToDictionary(fileObject => fileObject.Id);
         var definitionById = file.AllInstanceDefinitions.ToDictionary(definition => definition.Id);
-        var layerNameByIndex = file.AllLayers.ToDictionary(layer => layer.Index, layer => FirstNonEmpty(layer.FullPath, layer.Name, $"Layer {layer.Index}"));
+        var layerByIndex = file.AllLayers.ToDictionary(layer => layer.Index);
+        var materialByIndex = file.AllMaterials
+            .Where(material => material.MaterialIndex >= 0)
+            .ToDictionary(material => material.MaterialIndex);
 
         foreach (var fileObject in file.Objects)
         {
@@ -41,11 +45,11 @@ public sealed class ThreeDmReader
 
             if (fileObject.Geometry is InstanceReferenceGeometry instanceReference)
             {
-                ExpandInstanceReference(definitionById, objectById, layerNameByIndex, fileObject, instanceReference, Transform.Identity, result, 0);
+                ExpandInstanceReference(definitionById, objectById, layerByIndex, materialByIndex, fileObject, instanceReference, Transform.Identity, result, 0);
                 continue;
             }
 
-            result.Add(CreateBimObject(layerNameByIndex, fileObject, fileObject.Attributes, fileObject.Geometry, Transform.Identity, null));
+            result.Add(CreateBimObject(layerByIndex, materialByIndex, fileObject, fileObject.Attributes, fileObject.Geometry, Transform.Identity, null));
         }
 
         _log.Info($"Read {result.Count} non-deleted objects from 3DM.");
@@ -66,7 +70,8 @@ public sealed class ThreeDmReader
     private void ExpandInstanceReference(
         IReadOnlyDictionary<Guid, InstanceDefinitionGeometry> definitionById,
         IReadOnlyDictionary<Guid, File3dmObject> objectById,
-        IReadOnlyDictionary<int, string> layerNameByIndex,
+        IReadOnlyDictionary<int, Layer> layerByIndex,
+        IReadOnlyDictionary<int, Material> materialByIndex,
         File3dmObject instanceObject,
         InstanceReferenceGeometry instanceReference,
         Transform parentTransform,
@@ -95,26 +100,29 @@ public sealed class ThreeDmReader
 
             if (partObject.Geometry is InstanceReferenceGeometry nestedReference)
             {
-                ExpandInstanceReference(definitionById, objectById, layerNameByIndex, partObject, nestedReference, composedTransform, result, depth + 1);
+                ExpandInstanceReference(definitionById, objectById, layerByIndex, materialByIndex, partObject, nestedReference, composedTransform, result, depth + 1);
                 continue;
             }
 
-            result.Add(CreateBimObject(layerNameByIndex, partObject, MergeAttributes(instanceObject.Attributes, partObject.Attributes), partObject.Geometry, composedTransform, instanceObject));
+            result.Add(CreateBimObject(layerByIndex, materialByIndex, partObject, MergeAttributes(instanceObject.Attributes, partObject.Attributes), partObject.Geometry, composedTransform, instanceObject));
         }
     }
 
     private static RhinoBimObject CreateBimObject(
-        IReadOnlyDictionary<int, string> layerNameByIndex,
+        IReadOnlyDictionary<int, Layer> layerByIndex,
+        IReadOnlyDictionary<int, Material> materialByIndex,
         File3dmObject fileObject,
         ObjectAttributes attributes,
         GeometryBase geometry,
         Transform transform,
         File3dmObject? instanceObject)
     {
-        var definitionLayerName = ResolveLayerName(layerNameByIndex, attributes.LayerIndex);
-        var instanceLayerName = instanceObject?.Attributes is null ? string.Empty : ResolveLayerName(layerNameByIndex, instanceObject.Attributes.LayerIndex);
+        var definitionLayerName = ResolveLayerName(layerByIndex, attributes.LayerIndex);
+        var instanceLayerName = instanceObject?.Attributes is null ? string.Empty : ResolveLayerName(layerByIndex, instanceObject.Attributes.LayerIndex);
         var layerName = FirstNonEmpty(instanceLayerName, definitionLayerName);
         var name = FirstNonEmpty(attributes.Name, fileObject.Name, instanceObject?.Name, fileObject.Id.ToString());
+        var resolvedMaterial = ResolveMaterial(attributes, instanceObject?.Attributes, layerByIndex, materialByIndex);
+        var resolvedColor = ResolveDisplayColor(attributes, instanceObject?.Attributes, layerByIndex, materialByIndex, resolvedMaterial);
         var copiedGeometry = geometry.Duplicate();
         if (!transform.IsIdentity)
         {
@@ -138,7 +146,13 @@ public sealed class ThreeDmReader
             AdditionalLayerNames = GetAdditionalLayerNames(layerName, definitionLayerName),
             GeometryType = copiedGeometry.GetType().Name,
             UserText = userText,
-            Geometry = copiedGeometry
+            Geometry = copiedGeometry,
+            RhinoMaterialName = resolvedMaterial?.Name ?? string.Empty,
+            DisplayColorName = resolvedColor.Name,
+            DisplayColorRed = resolvedColor.Color?.R,
+            DisplayColorGreen = resolvedColor.Color?.G,
+            DisplayColorBlue = resolvedColor.Color?.B,
+            DisplayTransparency = resolvedColor.Transparency
         };
     }
 
@@ -177,14 +191,91 @@ public sealed class ThreeDmReader
         return merged;
     }
 
-    private static string ResolveLayerName(IReadOnlyDictionary<int, string> layerNameByIndex, int layerIndex)
+    private static string ResolveLayerName(IReadOnlyDictionary<int, Layer> layerByIndex, int layerIndex)
     {
-        if (layerIndex >= 0 && layerNameByIndex.TryGetValue(layerIndex, out var layerName))
+        if (layerIndex >= 0 && layerByIndex.TryGetValue(layerIndex, out var layer))
         {
-            return layerName;
+            return FirstNonEmpty(layer.FullPath, layer.Name, $"Layer {layer.Index}");
         }
 
         return string.Empty;
+    }
+
+    private static Material? ResolveMaterial(
+        ObjectAttributes attributes,
+        ObjectAttributes? parentAttributes,
+        IReadOnlyDictionary<int, Layer> layerByIndex,
+        IReadOnlyDictionary<int, Material> materialByIndex)
+    {
+        return attributes.MaterialSource switch
+        {
+            ObjectMaterialSource.MaterialFromObject => ResolveMaterialByIndex(attributes.MaterialIndex, materialByIndex),
+            ObjectMaterialSource.MaterialFromLayer => ResolveLayerMaterial(attributes.LayerIndex, layerByIndex, materialByIndex),
+            ObjectMaterialSource.MaterialFromParent when parentAttributes is not null => ResolveMaterial(parentAttributes, null, layerByIndex, materialByIndex),
+            _ => ResolveMaterialByIndex(attributes.MaterialIndex, materialByIndex) ?? ResolveLayerMaterial(attributes.LayerIndex, layerByIndex, materialByIndex)
+        };
+    }
+
+    private static Material? ResolveMaterialByIndex(int materialIndex, IReadOnlyDictionary<int, Material> materialByIndex)
+    {
+        return materialIndex >= 0 && materialByIndex.TryGetValue(materialIndex, out var material) && !material.IsDeleted
+            ? material
+            : null;
+    }
+
+    private static Material? ResolveLayerMaterial(
+        int layerIndex,
+        IReadOnlyDictionary<int, Layer> layerByIndex,
+        IReadOnlyDictionary<int, Material> materialByIndex)
+    {
+        return layerIndex >= 0 && layerByIndex.TryGetValue(layerIndex, out var layer)
+            ? ResolveMaterialByIndex(layer.RenderMaterialIndex, materialByIndex)
+            : null;
+    }
+
+    private static ResolvedColor ResolveDisplayColor(
+        ObjectAttributes attributes,
+        ObjectAttributes? parentAttributes,
+        IReadOnlyDictionary<int, Layer> layerByIndex,
+        IReadOnlyDictionary<int, Material> materialByIndex,
+        Material? resolvedMaterial)
+    {
+        return attributes.ColorSource switch
+        {
+            ObjectColorSource.ColorFromObject => FromColor(attributes.ObjectColor, "Rhino object color"),
+            ObjectColorSource.ColorFromLayer => FromLayer(attributes.LayerIndex, layerByIndex),
+            ObjectColorSource.ColorFromMaterial => FromMaterial(resolvedMaterial ?? ResolveMaterial(attributes, parentAttributes, layerByIndex, materialByIndex)),
+            ObjectColorSource.ColorFromParent when parentAttributes is not null => ResolveDisplayColor(parentAttributes, null, layerByIndex, materialByIndex, ResolveMaterial(parentAttributes, null, layerByIndex, materialByIndex)),
+            _ => FromColor(attributes.ObjectColor, "Rhino object color")
+        };
+    }
+
+    private static ResolvedColor FromLayer(int layerIndex, IReadOnlyDictionary<int, Layer> layerByIndex)
+    {
+        return layerIndex >= 0 && layerByIndex.TryGetValue(layerIndex, out var layer)
+            ? FromColor(layer.Color, $"Rhino layer color: {FirstNonEmpty(layer.FullPath, layer.Name, $"Layer {layer.Index}")}")
+            : ResolvedColor.Empty;
+    }
+
+    private static ResolvedColor FromMaterial(Material? material)
+    {
+        if (material is null)
+        {
+            return ResolvedColor.Empty;
+        }
+
+        var color = material.DiffuseColor.IsEmpty ? material.PreviewColor : material.DiffuseColor;
+        return new ResolvedColor(
+            color.IsEmpty ? null : color,
+            FirstNonEmpty(material.Name, "Rhino material color"),
+            Clamp01(material.Transparency));
+    }
+
+    private static ResolvedColor FromColor(Color color, string name)
+    {
+        return color.IsEmpty
+            ? ResolvedColor.Empty
+            : new ResolvedColor(color, name, color.A < 255 ? Clamp01(1.0 - (color.A / 255.0)) : null);
     }
 
     private static void AddUserStrings(Dictionary<string, string> values, System.Collections.Specialized.NameValueCollection? userStrings)
@@ -212,5 +303,15 @@ public sealed class ThreeDmReader
     private static string FirstNonEmpty(params string?[] values)
     {
         return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? string.Empty;
+    }
+
+    private static double Clamp01(double value)
+    {
+        return Math.Max(0.0, Math.Min(1.0, value));
+    }
+
+    private sealed record ResolvedColor(Color? Color, string Name, double? Transparency)
+    {
+        public static ResolvedColor Empty { get; } = new(null, string.Empty, null);
     }
 }

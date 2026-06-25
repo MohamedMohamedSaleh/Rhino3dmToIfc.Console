@@ -4,6 +4,7 @@ using Xbim.Ifc4.GeometricModelResource;
 using Xbim.Ifc4.GeometryResource;
 using Xbim.Ifc4.Kernel;
 using Xbim.Ifc4.MeasureResource;
+using Xbim.Ifc4.PresentationAppearanceResource;
 using Xbim.Ifc4.PresentationOrganizationResource;
 using Xbim.Ifc4.RepresentationResource;
 
@@ -148,6 +149,7 @@ public sealed class IfcGeometryBuilder
         shapeRepresentation.RepresentationType = "Tessellation";
         shapeRepresentation.Items.Add(faceSet);
         AssignToLayers(faceSet, source, layers);
+        AssignSurfaceStyle(faceSet, source);
 
         var productShape = model.Instances.New<IfcProductDefinitionShape>();
         productShape.Representations.Add(shapeRepresentation);
@@ -224,6 +226,7 @@ public sealed class IfcGeometryBuilder
         shapeRepresentation.RepresentationType = "Tessellation";
         shapeRepresentation.Items.Add(faceSet);
         AssignToLayers(faceSet, source, layers);
+        AssignSurfaceStyle(faceSet, source);
 
         var productShape = model.Instances.New<IfcProductDefinitionShape>();
         productShape.Representations.Add(shapeRepresentation);
@@ -270,6 +273,7 @@ public sealed class IfcGeometryBuilder
         }
 
         AssignToLayers(polyline, source, layers);
+        AssignCurveStyle(polyline, source);
 
         var shapeRepresentation = model.Instances.New<IfcShapeRepresentation>();
         shapeRepresentation.ContextOfItems = context;
@@ -289,6 +293,90 @@ public sealed class IfcGeometryBuilder
         {
             AssignToLayer(item, layerName, layers);
         }
+    }
+
+    private static void AssignSurfaceStyle(IfcRepresentationItem item, RhinoBimObject source)
+    {
+        if (!TryGetDisplayColor(source, out var red, out var green, out var blue))
+        {
+            return;
+        }
+
+        var model = item.Model;
+        var color = CreateColour(model, red, green, blue);
+        var rendering = model.Instances.New<IfcSurfaceStyleRendering>();
+        rendering.SurfaceColour = color;
+        rendering.DiffuseColour = color;
+        rendering.ReflectanceMethod = Xbim.Ifc4.Interfaces.IfcReflectanceMethodEnum.NOTDEFINED;
+        if (source.DisplayTransparency is { } transparency)
+        {
+            rendering.Transparency = new IfcNormalisedRatioMeasure(Clamp01(transparency));
+        }
+
+        var surfaceStyle = model.Instances.New<IfcSurfaceStyle>();
+        surfaceStyle.Name = string.IsNullOrWhiteSpace(source.DisplayColorName) ? "Rhino display color" : source.DisplayColorName;
+        surfaceStyle.Side = Xbim.Ifc4.Interfaces.IfcSurfaceSide.BOTH;
+        surfaceStyle.Styles.Add(rendering);
+
+        var styleAssignment = model.Instances.New<IfcPresentationStyleAssignment>();
+        styleAssignment.Styles.Add(surfaceStyle);
+
+        var styledItem = model.Instances.New<IfcStyledItem>();
+        styledItem.Item = item;
+        styledItem.Name = surfaceStyle.Name;
+        styledItem.Styles.Add(styleAssignment);
+    }
+
+    private static void AssignCurveStyle(IfcRepresentationItem item, RhinoBimObject source)
+    {
+        if (!TryGetDisplayColor(source, out var red, out var green, out var blue))
+        {
+            return;
+        }
+
+        var model = item.Model;
+        var curveStyle = model.Instances.New<IfcCurveStyle>();
+        curveStyle.Name = string.IsNullOrWhiteSpace(source.DisplayColorName) ? "Rhino display color" : source.DisplayColorName;
+        curveStyle.CurveColour = CreateColour(model, red, green, blue);
+        curveStyle.ModelOrDraughting = new IfcBoolean(true);
+
+        var styleAssignment = model.Instances.New<IfcPresentationStyleAssignment>();
+        styleAssignment.Styles.Add(curveStyle);
+
+        var styledItem = model.Instances.New<IfcStyledItem>();
+        styledItem.Item = item;
+        styledItem.Name = curveStyle.Name;
+        styledItem.Styles.Add(styleAssignment);
+    }
+
+    private static IfcColourRgb CreateColour(Xbim.Common.IModel model, byte red, byte green, byte blue)
+    {
+        var color = model.Instances.New<IfcColourRgb>();
+        color.Red = new IfcNormalisedRatioMeasure(red / 255.0);
+        color.Green = new IfcNormalisedRatioMeasure(green / 255.0);
+        color.Blue = new IfcNormalisedRatioMeasure(blue / 255.0);
+        return color;
+    }
+
+    private static bool TryGetDisplayColor(RhinoBimObject source, out byte red, out byte green, out byte blue)
+    {
+        if (source.DisplayColorRed is { } r && source.DisplayColorGreen is { } g && source.DisplayColorBlue is { } b)
+        {
+            red = r;
+            green = g;
+            blue = b;
+            return true;
+        }
+
+        red = 0;
+        green = 0;
+        blue = 0;
+        return false;
+    }
+
+    private static double Clamp01(double value)
+    {
+        return Math.Max(0.0, Math.Min(1.0, value));
     }
 
     private static IEnumerable<string> GetObjectLayerNames(RhinoBimObject source)

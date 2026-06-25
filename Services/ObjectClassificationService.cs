@@ -39,7 +39,7 @@ public sealed class ObjectClassificationService
             obj.IfcName = GetUserText(obj, "IfcName", obj.ObjectName);
             obj.IfcDescription = GetUserText(obj, "IfcDescription", string.Empty);
             obj.IfcStorey = GetUserText(obj, "IfcStorey", options.DefaultStorey);
-            obj.IfcMaterial = GetUserText(obj, "IfcMaterial", string.Empty);
+            obj.IfcMaterial = GetUserText(obj, "IfcMaterial", obj.RhinoMaterialName);
             obj.IfcPropertySetsJson = GetUserText(obj, "IfcPropertySetsJson", string.Empty);
             obj.IfcFullDataJson = GetUserText(obj, "IfcFullDataJson", string.Empty);
             obj.IsSupportedGeometry = obj.Geometry is Mesh or Brep or Extrusion or Surface or Curve;
