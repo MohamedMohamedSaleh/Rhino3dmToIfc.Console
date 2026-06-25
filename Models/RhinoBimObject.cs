@@ -32,6 +32,10 @@ public sealed class RhinoBimObject
 
     public string IfcType { get; set; } = string.Empty;
 
+    public string IfcPredefinedType { get; set; } = string.Empty;
+
+    public string IfcObjectType { get; set; } = string.Empty;
+
     public string IfcName { get; set; } = string.Empty;
 
     public string IfcDescription { get; set; } = string.Empty;

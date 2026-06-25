@@ -18,6 +18,7 @@ public sealed class ObjectClassificationService
         "IfcStair",
         "IfcRailing",
         "IfcCovering",
+        "IfcMember",
         "IfcBuildingElementProxy"
     ];
 
@@ -34,7 +35,10 @@ public sealed class ObjectClassificationService
 
         foreach (var obj in objects)
         {
-            obj.IfcType = ResolveIfcType(obj, options.DefaultIfcType);
+            var classification = ResolveClassification(obj, options.DefaultIfcType);
+            obj.IfcType = classification.IfcType;
+            obj.IfcPredefinedType = GetUserText(obj, "IfcPredefinedType", classification.PredefinedType);
+            obj.IfcObjectType = GetUserText(obj, "IfcObjectType", classification.ObjectType);
             obj.IfcGlobalId = ResolveGlobalId(obj);
             obj.IfcName = GetUserText(obj, "IfcName", obj.ObjectName);
             obj.IfcDescription = GetUserText(obj, "IfcDescription", string.Empty);
@@ -66,29 +70,70 @@ public sealed class ObjectClassificationService
         return result;
     }
 
-    private static string ResolveIfcType(RhinoBimObject obj, string defaultIfcType)
+    private static Classification ResolveClassification(RhinoBimObject obj, string defaultIfcType)
     {
+        var fromLayerMapping = ResolveLayerClassification(obj);
         var fromUserText = NormalizeIfcType(GetUserText(obj, "IfcType", string.Empty));
         if (!string.IsNullOrEmpty(fromUserText))
         {
-            return fromUserText;
+            return string.Equals(fromUserText, fromLayerMapping.IfcType, StringComparison.OrdinalIgnoreCase)
+                ? new Classification(fromUserText, fromLayerMapping.PredefinedType, fromLayerMapping.ObjectType)
+                : new Classification(fromUserText, string.Empty, string.Empty);
         }
 
-        var fromLayer = FindSupportedIfcType(obj.LayerName);
+        if (!string.IsNullOrEmpty(fromLayerMapping.IfcType))
+        {
+            return fromLayerMapping;
+        }
+
+        var fromLayer = FindSupportedIfcType(GetLayerSearchText(obj));
         if (!string.IsNullOrEmpty(fromLayer))
         {
-            return fromLayer;
+            return new Classification(fromLayer, string.Empty, string.Empty);
         }
 
         var fromName = ResolveNamePrefix(obj.ObjectName);
         if (!string.IsNullOrEmpty(fromName))
         {
-            return fromName;
+            return new Classification(fromName, string.Empty, string.Empty);
         }
 
-        return NormalizeIfcType(defaultIfcType) is { Length: > 0 } normalizedDefault
+        var fallback = NormalizeIfcType(defaultIfcType) is { Length: > 0 } normalizedDefault
             ? normalizedDefault
             : "IfcBuildingElementProxy";
+        return new Classification(fallback, string.Empty, string.Empty);
+    }
+
+    private static Classification ResolveLayerClassification(RhinoBimObject obj)
+    {
+        var layerText = GetLayerSearchText(obj);
+        if (ContainsAny(layerText, "stiffener", "stiffeners"))
+        {
+            return new Classification("IfcMember", "USERDEFINED", "Stiffener");
+        }
+
+        if (ContainsAny(layerText, "angle", "angles", "bracket", "brackets", "fixing"))
+        {
+            return new Classification("IfcMember", "USERDEFINED", "L-Angle");
+        }
+
+        if (ContainsAny(layerText, "panel", "panels", "cladding", "clad", "sheet", "sheets"))
+        {
+            return new Classification("IfcCovering", "CLADDING", "Cladding Sheet");
+        }
+
+        return Classification.Empty;
+    }
+
+    private static string GetLayerSearchText(RhinoBimObject obj)
+    {
+        return string.Join(" ", obj.LayerName, string.Join(" ", obj.AdditionalLayerNames));
+    }
+
+    private static bool ContainsAny(string text, params string[] tokens)
+    {
+        return !string.IsNullOrWhiteSpace(text) &&
+            tokens.Any(token => text.Contains(token, StringComparison.OrdinalIgnoreCase));
     }
 
     private string ResolveGlobalId(RhinoBimObject obj)
@@ -185,5 +230,10 @@ public sealed class ObjectClassificationService
                 summary.UnsupportedOtherObjects++;
                 break;
         }
+    }
+
+    private sealed record Classification(string IfcType, string PredefinedType, string ObjectType)
+    {
+        public static Classification Empty { get; } = new(string.Empty, string.Empty, string.Empty);
     }
 }

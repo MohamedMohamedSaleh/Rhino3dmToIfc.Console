@@ -226,18 +226,61 @@ public sealed class IfcModelBuilder
             "IfcStair" => model.Instances.New<IfcStair>(),
             "IfcRailing" => model.Instances.New<IfcRailing>(),
             "IfcCovering" => model.Instances.New<IfcCovering>(),
+            "IfcMember" => model.Instances.New<IfcMember>(),
             _ => model.Instances.New<IfcBuildingElementProxy>()
         };
 
         product.GlobalId = source.IfcGlobalId;
         product.OwnerHistory = ownerHistory;
         product.Name = string.IsNullOrWhiteSpace(source.IfcName) ? source.ObjectName : source.IfcName;
+        if (!string.IsNullOrWhiteSpace(source.IfcObjectType))
+        {
+            product.ObjectType = source.IfcObjectType.Trim();
+        }
+
+        ApplyIfcClassification(product, source);
+
         if (!string.IsNullOrWhiteSpace(source.IfcDescription))
         {
             product.Description = source.IfcDescription;
         }
 
         return product;
+    }
+
+    private static void ApplyIfcClassification(IfcProduct product, RhinoBimObject source)
+    {
+        if (product is IfcCovering covering)
+        {
+            covering.PredefinedType = ParseCoveringType(source.IfcPredefinedType);
+            return;
+        }
+
+        if (product is IfcMember member)
+        {
+            member.PredefinedType = ParseMemberType(source.IfcPredefinedType);
+        }
+    }
+
+    private static IfcCoveringTypeEnum? ParseCoveringType(string value)
+    {
+        return Enum.TryParse<IfcCoveringTypeEnum>(NormalizePredefinedType(value), true, out var parsed)
+            ? parsed
+            : null;
+    }
+
+    private static IfcMemberTypeEnum? ParseMemberType(string value)
+    {
+        return Enum.TryParse<IfcMemberTypeEnum>(NormalizePredefinedType(value), true, out var parsed)
+            ? parsed
+            : null;
+    }
+
+    private static string NormalizePredefinedType(string value)
+    {
+        return string.IsNullOrWhiteSpace(value)
+            ? string.Empty
+            : value.Trim().Replace(".", string.Empty).Replace(" ", string.Empty).Replace("-", string.Empty).ToUpperInvariant();
     }
 
     private static void Relate(IfcStore model, IfcOwnerHistory ownerHistory, IfcObjectDefinition relatingObject, IfcObjectDefinition relatedObject, string name)
