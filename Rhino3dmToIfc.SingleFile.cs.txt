@@ -102,7 +102,6 @@ namespace Rhino3dmToIfc.Console
 
             try
             {
-                System.Console.WriteLine("Starting export...");
                 var reader = new ThreeDmReader(log);
                 var classifier = new ObjectClassificationService(log);
                 var modelBuilder = new IfcModelBuilder(log, new IfcGeometryBuilder(log), new IfcPropertySetBuilder(log));
