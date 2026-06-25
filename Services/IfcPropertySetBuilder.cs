@@ -20,6 +20,31 @@ public sealed class IfcPropertySetBuilder
         "IfcFullDataJson"
     };
 
+    private static readonly HashSet<string> MappedUserTextKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Panel_Name",
+        "Panel Name",
+        "Material",
+        "Thickness",
+        "Width",
+        "Length",
+        "Depth",
+        "Qty",
+        "Quantity",
+        "Count",
+        "Installation",
+        "Screw",
+        "Tape",
+        "pop rivet",
+        "PopRivet",
+        "Pop Rivet",
+        "Geo Type",
+        "GeoType",
+        "Panel_Plane",
+        "Panel Plane",
+        "_PancakeGenerated"
+    };
+
     private readonly LogService _log;
 
     public IfcPropertySetBuilder(LogService log)
@@ -83,7 +108,9 @@ public sealed class IfcPropertySetBuilder
     private static void AttachRhinoUserText(IfcProduct product, RhinoBimObject source)
     {
         var values = source.UserText
-            .Where(pair => !InternalUserTextKeys.Contains(pair.Key) && !string.IsNullOrWhiteSpace(pair.Value))
+            .Where(pair => !InternalUserTextKeys.Contains(pair.Key) &&
+                !MappedUserTextKeys.Contains(pair.Key) &&
+                !string.IsNullOrWhiteSpace(pair.Value))
             .ToDictionary(pair => pair.Key, pair => (object?)pair.Value.Trim(), StringComparer.OrdinalIgnoreCase);
 
         if (values.Count > 0)
