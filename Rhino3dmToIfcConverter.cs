@@ -1,0 +1,2887 @@
+// -----------------------------------------------------------------------------
+// Rhino3dmToIfc reusable single-file converter.
+// Copy this file into any .NET project that references:
+//   - Newtonsoft.Json 13.0.4
+//   - Rhino3dm 8.17.0
+//   - Xbim.Essentials 6.0.587
+// -----------------------------------------------------------------------------
+
+using Microsoft.Extensions.DependencyInjection;
+using Newtonsoft.Json.Linq;
+using Rhino.DocObjects;
+using Rhino.FileIO;
+using Rhino.Geometry;
+using Rhino3dmToIfc.Console.Models;
+using Rhino3dmToIfc.Console.Services;
+using System.Collections.Generic;
+using System.Collections.Specialized;
+using System.Drawing;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System;
+using Xbim.Common.Configuration;
+using Xbim.Common.Step21;
+using Xbim.Common;
+using Xbim.IO;
+using Xbim.Ifc4.ActorResource;
+using Xbim.Ifc4.DateTimeResource;
+using Xbim.Ifc4.GeometricConstraintResource;
+using Xbim.Ifc4.GeometricModelResource;
+using Xbim.Ifc4.GeometryResource;
+using Xbim.Ifc4.Interfaces;
+using Xbim.Ifc4.Kernel;
+using Xbim.Ifc4.MaterialResource;
+using Xbim.Ifc4.MeasureResource;
+using Xbim.Ifc4.PresentationAppearanceResource;
+using Xbim.Ifc4.PresentationOrganizationResource;
+using Xbim.Ifc4.ProductExtension;
+using Xbim.Ifc4.PropertyResource;
+using Xbim.Ifc4.QuantityResource;
+using Xbim.Ifc4.RepresentationResource;
+using Xbim.Ifc4.SharedBldgElements;
+using Xbim.Ifc4.UtilityResource;
+using Xbim.Ifc;
+
+namespace Rhino3dmToIfc.Console
+{
+    /// <summary>Converts Rhino .3dm files to IFC4.</summary>
+    public sealed class Rhino3dmToIfcConverter
+    {
+        public Task<ExportSummary> ConvertAsync(
+            string inputPath,
+            string outputPath,
+            string defaultStorey = "Level 1",
+            string defaultIfcType = "IfcBuildingElementProxy",
+            string? logPath = null)
+        {
+            return ConvertAsync(new IfcExportOptions
+            {
+                InputPath = inputPath,
+                OutputPath = outputPath,
+                DefaultStorey = defaultStorey,
+                DefaultIfcType = defaultIfcType,
+                LogPath = logPath ?? string.Empty
+            });
+        }
+
+        public async Task<ExportSummary> ConvertAsync(IfcExportOptions options)
+        {
+            ArgumentNullException.ThrowIfNull(options);
+            if (!File.Exists(options.InputPath))
+            {
+                throw new FileNotFoundException("Input 3DM file does not exist.", options.InputPath);
+            }
+
+            if (!string.Equals(Path.GetExtension(options.InputPath), ".3dm", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException("Input file must have a .3dm extension.", nameof(options));
+            }
+
+            if (!string.Equals(Path.GetExtension(options.OutputPath), ".ifc", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException("Output file must have a .ifc extension.", nameof(options));
+            }
+
+            var outputPath = Path.GetFullPath(options.OutputPath);
+            var outputDirectory = Path.GetDirectoryName(outputPath);
+            if (!string.IsNullOrWhiteSpace(outputDirectory))
+            {
+                Directory.CreateDirectory(outputDirectory);
+            }
+
+            var logPath = string.IsNullOrWhiteSpace(options.LogPath)
+                ? Path.Combine(outputDirectory ?? Directory.GetCurrentDirectory(), "model_export.log")
+                : Path.GetFullPath(options.LogPath);
+            var logDirectory = Path.GetDirectoryName(logPath);
+            if (!string.IsNullOrWhiteSpace(logDirectory))
+            {
+                Directory.CreateDirectory(logDirectory);
+            }
+
+            options.LogPath = logPath;
+
+            var summary = new ExportSummary
+            {
+                OutputPath = outputPath,
+                LogPath = logPath
+            };
+
+            await using var log = new LogService(logPath);
+            log.Info("Rhino3dmToIfc.Console export started.");
+            log.Info($"Input path: {options.InputPath}");
+            log.Info($"Output path: {options.OutputPath}");
+
+            try
+            {
+                var reader = new ThreeDmReader(log);
+                var classifier = new ObjectClassificationService(log);
+                var modelBuilder = new IfcModelBuilder(log, new IfcGeometryBuilder(log), new IfcPropertySetBuilder(log));
+
+                var objects = reader.Read(options.InputPath);
+                summary.TotalObjects = objects.Count;
+                log.Info($"Total readable objects: {summary.TotalObjects}");
+
+                var classifiedObjects = classifier.Classify(objects, options, summary);
+                modelBuilder.BuildAndSave(classifiedObjects, reader.LastReadLayers, options, summary);
+
+                log.Info("Export completed.");
+                log.WriteSummary(summary);
+                return summary;
+            }
+            catch (Exception ex)
+            {
+                summary.FailedObjects++;
+                log.Error("Fatal export failure.", ex);
+                log.WriteSummary(summary);
+                throw;
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Source: Models/ExportSummary.cs
+// -----------------------------------------------------------------------------
+namespace Rhino3dmToIfc.Console.Models
+{
+public sealed class ExportSummary
+{
+    public int TotalObjects { get; set; }
+
+    public int ExportedObjects { get; set; }
+
+    public int SkippedObjects { get; set; }
+
+    public int MeshObjects { get; set; }
+
+    public int UnsupportedBrepObjects { get; set; }
+
+    public int UnsupportedSurfaceObjects { get; set; }
+
+    public int UnsupportedExtrusionObjects { get; set; }
+
+    public int UnsupportedOtherObjects { get; set; }
+
+    public int FailedObjects { get; set; }
+
+    public string OutputPath { get; set; } = string.Empty;
+
+    public string LogPath { get; set; } = string.Empty;
+
+    public int WarningCount { get; set; }
+}
+}
+
+// -----------------------------------------------------------------------------
+// Source: Models/IfcExportOptions.cs
+// -----------------------------------------------------------------------------
+namespace Rhino3dmToIfc.Console.Models
+{
+public sealed class IfcExportOptions
+{
+    public string InputPath { get; init; } = string.Empty;
+
+    public string OutputPath { get; init; } = string.Empty;
+
+    public string DefaultStorey { get; init; } = "Level 1";
+
+    public string DefaultIfcType { get; init; } = "IfcBuildingElementProxy";
+
+    public string LogPath { get; set; } = string.Empty;
+}
+}
+
+// -----------------------------------------------------------------------------
+// Source: Models/RhinoBimObject.cs
+// -----------------------------------------------------------------------------
+namespace Rhino3dmToIfc.Console.Models
+{
+public sealed class RhinoBimObject
+{
+    public Guid RhinoObjectId { get; set; }
+
+    public string ObjectName { get; set; } = string.Empty;
+
+    public string LayerName { get; set; } = string.Empty;
+
+    public List<string> AdditionalLayerNames { get; set; } = [];
+
+    public string GeometryType { get; set; } = string.Empty;
+
+    public Dictionary<string, string> UserText { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public object? Geometry { get; set; }
+
+    public string RhinoMaterialName { get; set; } = string.Empty;
+
+    public string DisplayColorName { get; set; } = string.Empty;
+
+    public byte? DisplayColorRed { get; set; }
+
+    public byte? DisplayColorGreen { get; set; }
+
+    public byte? DisplayColorBlue { get; set; }
+
+    public double? DisplayTransparency { get; set; }
+
+    public string IfcGlobalId { get; set; } = string.Empty;
+
+    public string IfcType { get; set; } = string.Empty;
+
+    public string IfcPredefinedType { get; set; } = string.Empty;
+
+    public string IfcObjectType { get; set; } = string.Empty;
+
+    public string IfcName { get; set; } = string.Empty;
+
+    public string IfcDescription { get; set; } = string.Empty;
+
+    public string IfcStorey { get; set; } = string.Empty;
+
+    public string IfcMaterial { get; set; } = string.Empty;
+
+    public string IfcPropertySetsJson { get; set; } = string.Empty;
+
+    public string IfcFullDataJson { get; set; } = string.Empty;
+
+    public bool IsSupportedGeometry { get; set; }
+
+    public string SkipReason { get; set; } = string.Empty;
+}
+}
+
+// -----------------------------------------------------------------------------
+// Source: Models/RhinoLayerInfo.cs
+// -----------------------------------------------------------------------------
+namespace Rhino3dmToIfc.Console.Models
+{
+public sealed class RhinoLayerInfo
+{
+    public string Name { get; set; } = string.Empty;
+}
+}
+
+// -----------------------------------------------------------------------------
+// Source: Services/CommandLineOptionsParser.cs
+// -----------------------------------------------------------------------------
+namespace Rhino3dmToIfc.Console.Services
+{
+public sealed class CommandLineOptionsParser
+{
+    private static readonly HashSet<string> RequiredOptions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "--input",
+        "--output"
+    };
+
+    public IfcExportOptions? Parse(string[] args)
+    {
+        if (args.Length == 0 || args.Contains("--help", StringComparer.OrdinalIgnoreCase) || args.Contains("-h", StringComparer.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < args.Length; i++)
+        {
+            var key = args[i];
+            if (!key.StartsWith("--", StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            values[key] = args[++i];
+        }
+
+        if (RequiredOptions.Any(required => !values.ContainsKey(required)))
+        {
+            return null;
+        }
+
+        return new IfcExportOptions
+        {
+            InputPath = values["--input"],
+            OutputPath = values["--output"],
+            DefaultStorey = values.GetValueOrDefault("--default-storey", "Level 1"),
+            DefaultIfcType = values.GetValueOrDefault("--default-ifc-type", "IfcBuildingElementProxy")
+        };
+    }
+
+    public static void PrintUsage()
+    {
+        System.Console.WriteLine("Usage:");
+        System.Console.WriteLine("  dotnet run -- --input \"/path/model.3dm\" --output \"/path/model.ifc\" --default-storey \"Level 1\" --default-ifc-type \"IfcBuildingElementProxy\"");
+    }
+}
+}
+
+// -----------------------------------------------------------------------------
+// Source: Services/LogService.cs
+// -----------------------------------------------------------------------------
+namespace Rhino3dmToIfc.Console.Services
+{
+public sealed class LogService : IAsyncDisposable
+{
+    private readonly StreamWriter _writer;
+
+    public LogService(string logPath)
+    {
+        var directory = Path.GetDirectoryName(Path.GetFullPath(logPath));
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        _writer = new StreamWriter(logPath, append: false)
+        {
+            AutoFlush = true
+        };
+    }
+
+    public void Info(string message) => Write("INFO", message);
+
+    public void Warning(string message)
+    {
+        Write("WARN", message);
+    }
+
+    public void Error(string message, Exception? exception = null)
+    {
+        Write("ERROR", exception is null ? message : $"{message} {exception}");
+    }
+
+    public void WriteSummary(ExportSummary summary)
+    {
+        Info("Final summary:");
+        Info($"  Total objects: {summary.TotalObjects}");
+        Info($"  Exported objects: {summary.ExportedObjects}");
+        Info($"  Skipped objects: {summary.SkippedObjects}");
+        Info($"  Mesh objects: {summary.MeshObjects}");
+        Info($"  Unsupported Brep objects: {summary.UnsupportedBrepObjects}");
+        Info($"  Unsupported Surface objects: {summary.UnsupportedSurfaceObjects}");
+        Info($"  Unsupported Extrusion objects: {summary.UnsupportedExtrusionObjects}");
+        Info($"  Unsupported Other objects: {summary.UnsupportedOtherObjects}");
+        Info($"  Failed objects: {summary.FailedObjects}");
+        Info($"  Warnings: {summary.WarningCount}");
+        Info($"  Output path: {summary.OutputPath}");
+        Info($"  Log path: {summary.LogPath}");
+    }
+
+    private void Write(string level, string message)
+    {
+        var line = $"{DateTimeOffset.UtcNow:O} [{level}] {message}";
+        _writer.WriteLine(line);
+
+        if (level is "ERROR")
+        {
+            System.Console.Error.WriteLine(line);
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _writer.DisposeAsync();
+    }
+}
+}
+
+// -----------------------------------------------------------------------------
+// Source: Services/ThreeDmReader.cs
+// -----------------------------------------------------------------------------
+namespace Rhino3dmToIfc.Console.Services
+{
+public sealed class ThreeDmReader
+{
+    private readonly LogService _log;
+
+    public IReadOnlyList<RhinoLayerInfo> LastReadLayers { get; private set; } = [];
+
+    public ThreeDmReader(LogService log)
+    {
+        _log = log;
+    }
+
+    public List<RhinoBimObject> Read(string inputPath)
+    {
+        var file = File3dm.Read(inputPath) ?? throw new InvalidOperationException($"Unable to read 3DM file: {inputPath}");
+        LastReadLayers = ReadLayers(file);
+        var result = new List<RhinoBimObject>();
+        var objectById = file.Objects
+            .Where(fileObject => fileObject.HasId)
+            .ToDictionary(fileObject => fileObject.Id);
+        var definitionById = file.AllInstanceDefinitions.ToDictionary(definition => definition.Id);
+        var layerByIndex = file.AllLayers.ToDictionary(layer => layer.Index);
+        var materialByIndex = file.AllMaterials
+            .Where(material => material.MaterialIndex >= 0)
+            .ToDictionary(material => material.MaterialIndex);
+
+        foreach (var fileObject in file.Objects)
+        {
+            if (fileObject.IsDeleted || fileObject.Geometry is null || fileObject.Attributes is null)
+            {
+                continue;
+            }
+
+            if (fileObject.Attributes.IsInstanceDefinitionObject)
+            {
+                continue;
+            }
+
+            if (fileObject.Geometry is InstanceReferenceGeometry instanceReference)
+            {
+                ExpandInstanceReference(definitionById, objectById, layerByIndex, materialByIndex, fileObject, instanceReference, Transform.Identity, result, 0);
+                continue;
+            }
+
+            result.Add(CreateBimObject(layerByIndex, materialByIndex, fileObject, fileObject.Attributes, fileObject.Geometry, Transform.Identity, null));
+        }
+
+        _log.Info($"Read {result.Count} non-deleted objects from 3DM.");
+        _log.Info($"Read {LastReadLayers.Count} Rhino layers from 3DM.");
+        return result;
+    }
+
+    private static IReadOnlyList<RhinoLayerInfo> ReadLayers(File3dm file)
+    {
+        return file.AllLayers
+            .Select(layer => FirstNonEmpty(layer.FullPath, layer.Name))
+            .Where(layerName => !string.IsNullOrWhiteSpace(layerName))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(layerName => new RhinoLayerInfo { Name = layerName })
+            .ToList();
+    }
+
+    private void ExpandInstanceReference(
+        IReadOnlyDictionary<Guid, InstanceDefinitionGeometry> definitionById,
+        IReadOnlyDictionary<Guid, File3dmObject> objectById,
+        IReadOnlyDictionary<int, Layer> layerByIndex,
+        IReadOnlyDictionary<int, Material> materialByIndex,
+        File3dmObject instanceObject,
+        InstanceReferenceGeometry instanceReference,
+        Transform parentTransform,
+        List<RhinoBimObject> result,
+        int depth)
+    {
+        if (depth > 16)
+        {
+            _log.Warning($"Skipping nested instance {instanceObject.Id}: maximum instance nesting depth reached.");
+            return;
+        }
+
+        if (!definitionById.TryGetValue(instanceReference.ParentIdefId, out var definition))
+        {
+            _log.Warning($"Skipping instance {instanceObject.Id}: instance definition {instanceReference.ParentIdefId} was not found.");
+            return;
+        }
+
+        var composedTransform = parentTransform * instanceReference.Xform;
+        foreach (var partId in definition.GetObjectIds())
+        {
+            if (!objectById.TryGetValue(partId, out var partObject) || partObject.Geometry is null || partObject.Attributes is null || partObject.IsDeleted)
+            {
+                continue;
+            }
+
+            if (partObject.Geometry is InstanceReferenceGeometry nestedReference)
+            {
+                ExpandInstanceReference(definitionById, objectById, layerByIndex, materialByIndex, partObject, nestedReference, composedTransform, result, depth + 1);
+                continue;
+            }
+
+            result.Add(CreateBimObject(layerByIndex, materialByIndex, partObject, MergeAttributes(instanceObject.Attributes, partObject.Attributes), partObject.Geometry, composedTransform, instanceObject));
+        }
+    }
+
+    private static RhinoBimObject CreateBimObject(
+        IReadOnlyDictionary<int, Layer> layerByIndex,
+        IReadOnlyDictionary<int, Material> materialByIndex,
+        File3dmObject fileObject,
+        ObjectAttributes attributes,
+        GeometryBase geometry,
+        Transform transform,
+        File3dmObject? instanceObject)
+    {
+        var definitionLayerName = ResolveLayerName(layerByIndex, attributes.LayerIndex);
+        var instanceLayerName = instanceObject?.Attributes is null ? string.Empty : ResolveLayerName(layerByIndex, instanceObject.Attributes.LayerIndex);
+        var layerName = FirstNonEmpty(instanceLayerName, definitionLayerName);
+        var name = FirstNonEmpty(attributes.Name, fileObject.Name, instanceObject?.Name, fileObject.Id.ToString());
+        var resolvedMaterial = ResolveMaterial(attributes, instanceObject?.Attributes, layerByIndex, materialByIndex);
+        var resolvedColor = ResolveDisplayColor(attributes, instanceObject?.Attributes, layerByIndex, materialByIndex, resolvedMaterial);
+        var copiedGeometry = geometry.Duplicate();
+        if (!transform.IsIdentity)
+        {
+            copiedGeometry.Transform(transform);
+        }
+
+        var userText = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (instanceObject?.Attributes is not null)
+        {
+            AddUserStrings(userText, instanceObject.Attributes.GetUserStrings());
+        }
+
+        AddUserStrings(userText, attributes.GetUserStrings());
+        AddUserStrings(userText, copiedGeometry.GetUserStrings());
+
+        return new RhinoBimObject
+        {
+            RhinoObjectId = instanceObject?.Id ?? fileObject.Id,
+            ObjectName = name,
+            LayerName = layerName,
+            AdditionalLayerNames = GetAdditionalLayerNames(layerName, definitionLayerName),
+            GeometryType = copiedGeometry.GetType().Name,
+            UserText = userText,
+            Geometry = copiedGeometry,
+            RhinoMaterialName = resolvedMaterial?.Name ?? string.Empty,
+            DisplayColorName = resolvedColor.Name,
+            DisplayColorRed = resolvedColor.Color?.R,
+            DisplayColorGreen = resolvedColor.Color?.G,
+            DisplayColorBlue = resolvedColor.Color?.B,
+            DisplayTransparency = resolvedColor.Transparency
+        };
+    }
+
+    private static List<string> GetAdditionalLayerNames(string primaryLayerName, string definitionLayerName)
+    {
+        if (string.IsNullOrWhiteSpace(definitionLayerName) ||
+            string.Equals(primaryLayerName, definitionLayerName, StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        return [definitionLayerName];
+    }
+
+    private static ObjectAttributes MergeAttributes(ObjectAttributes instanceAttributes, ObjectAttributes partAttributes)
+    {
+        var merged = partAttributes.Duplicate();
+        if (string.IsNullOrWhiteSpace(merged.Name))
+        {
+            merged.Name = instanceAttributes.Name;
+        }
+
+        if (merged.LayerIndex < 0)
+        {
+            merged.LayerIndex = instanceAttributes.LayerIndex;
+        }
+
+        foreach (var key in instanceAttributes.GetUserStrings()?.AllKeys ?? [])
+        {
+            if (!string.IsNullOrWhiteSpace(key) && string.IsNullOrWhiteSpace(merged.GetUserString(key)))
+            {
+                merged.SetUserString(key, instanceAttributes.GetUserString(key));
+            }
+        }
+
+        return merged;
+    }
+
+    private static string ResolveLayerName(IReadOnlyDictionary<int, Layer> layerByIndex, int layerIndex)
+    {
+        if (layerIndex >= 0 && layerByIndex.TryGetValue(layerIndex, out var layer))
+        {
+            return FirstNonEmpty(layer.FullPath, layer.Name, $"Layer {layer.Index}");
+        }
+
+        return string.Empty;
+    }
+
+    private static Material? ResolveMaterial(
+        ObjectAttributes attributes,
+        ObjectAttributes? parentAttributes,
+        IReadOnlyDictionary<int, Layer> layerByIndex,
+        IReadOnlyDictionary<int, Material> materialByIndex)
+    {
+        return attributes.MaterialSource switch
+        {
+            ObjectMaterialSource.MaterialFromObject => ResolveMaterialByIndex(attributes.MaterialIndex, materialByIndex),
+            ObjectMaterialSource.MaterialFromLayer => ResolveLayerMaterial(attributes.LayerIndex, layerByIndex, materialByIndex),
+            ObjectMaterialSource.MaterialFromParent when parentAttributes is not null => ResolveMaterial(parentAttributes, null, layerByIndex, materialByIndex),
+            _ => ResolveMaterialByIndex(attributes.MaterialIndex, materialByIndex) ?? ResolveLayerMaterial(attributes.LayerIndex, layerByIndex, materialByIndex)
+        };
+    }
+
+    private static Material? ResolveMaterialByIndex(int materialIndex, IReadOnlyDictionary<int, Material> materialByIndex)
+    {
+        return materialIndex >= 0 && materialByIndex.TryGetValue(materialIndex, out var material) && !material.IsDeleted
+            ? material
+            : null;
+    }
+
+    private static Material? ResolveLayerMaterial(
+        int layerIndex,
+        IReadOnlyDictionary<int, Layer> layerByIndex,
+        IReadOnlyDictionary<int, Material> materialByIndex)
+    {
+        return layerIndex >= 0 && layerByIndex.TryGetValue(layerIndex, out var layer)
+            ? ResolveMaterialByIndex(layer.RenderMaterialIndex, materialByIndex)
+            : null;
+    }
+
+    private static ResolvedColor ResolveDisplayColor(
+        ObjectAttributes attributes,
+        ObjectAttributes? parentAttributes,
+        IReadOnlyDictionary<int, Layer> layerByIndex,
+        IReadOnlyDictionary<int, Material> materialByIndex,
+        Material? resolvedMaterial)
+    {
+        return attributes.ColorSource switch
+        {
+            ObjectColorSource.ColorFromObject => FromColor(attributes.ObjectColor, "Rhino object color"),
+            ObjectColorSource.ColorFromLayer => FromLayer(attributes.LayerIndex, layerByIndex),
+            ObjectColorSource.ColorFromMaterial => FromMaterial(resolvedMaterial ?? ResolveMaterial(attributes, parentAttributes, layerByIndex, materialByIndex)),
+            ObjectColorSource.ColorFromParent when parentAttributes is not null => ResolveDisplayColor(parentAttributes, null, layerByIndex, materialByIndex, ResolveMaterial(parentAttributes, null, layerByIndex, materialByIndex)),
+            _ => FromColor(attributes.ObjectColor, "Rhino object color")
+        };
+    }
+
+    private static ResolvedColor FromLayer(int layerIndex, IReadOnlyDictionary<int, Layer> layerByIndex)
+    {
+        return layerIndex >= 0 && layerByIndex.TryGetValue(layerIndex, out var layer)
+            ? FromColor(layer.Color, $"Rhino layer color: {FirstNonEmpty(layer.FullPath, layer.Name, $"Layer {layer.Index}")}")
+            : ResolvedColor.Empty;
+    }
+
+    private static ResolvedColor FromMaterial(Material? material)
+    {
+        if (material is null)
+        {
+            return ResolvedColor.Empty;
+        }
+
+        var color = material.DiffuseColor.IsEmpty ? material.PreviewColor : material.DiffuseColor;
+        return new ResolvedColor(
+            color.IsEmpty ? null : color,
+            FirstNonEmpty(material.Name, "Rhino material color"),
+            Clamp01(material.Transparency));
+    }
+
+    private static ResolvedColor FromColor(Color color, string name)
+    {
+        return color.IsEmpty
+            ? ResolvedColor.Empty
+            : new ResolvedColor(color, name, color.A < 255 ? Clamp01(1.0 - (color.A / 255.0)) : null);
+    }
+
+    private static void AddUserStrings(Dictionary<string, string> values, System.Collections.Specialized.NameValueCollection? userStrings)
+    {
+        if (userStrings is null)
+        {
+            return;
+        }
+
+        foreach (var key in userStrings.AllKeys)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                continue;
+            }
+
+            var value = userStrings[key];
+            if (value is not null)
+            {
+                values[key] = value;
+            }
+        }
+    }
+
+    private static string FirstNonEmpty(params string?[] values)
+    {
+        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? string.Empty;
+    }
+
+    private static double Clamp01(double value)
+    {
+        return Math.Max(0.0, Math.Min(1.0, value));
+    }
+
+    private sealed record ResolvedColor(Color? Color, string Name, double? Transparency)
+    {
+        public static ResolvedColor Empty { get; } = new(null, string.Empty, null);
+    }
+}
+}
+
+// -----------------------------------------------------------------------------
+// Source: Services/ObjectClassificationService.cs
+// -----------------------------------------------------------------------------
+namespace Rhino3dmToIfc.Console.Services
+{
+public sealed class ObjectClassificationService
+{
+    private static readonly string[] SupportedIfcTypes =
+    [
+        "IfcWall",
+        "IfcSlab",
+        "IfcColumn",
+        "IfcBeam",
+        "IfcDoor",
+        "IfcWindow",
+        "IfcRoof",
+        "IfcStair",
+        "IfcRailing",
+        "IfcCovering",
+        "IfcMember",
+        "IfcBuildingElementProxy"
+    ];
+
+    private readonly LogService _log;
+
+    public ObjectClassificationService(LogService log)
+    {
+        _log = log;
+    }
+
+    public IReadOnlyList<RhinoBimObject> Classify(IEnumerable<RhinoBimObject> objects, IfcExportOptions options, ExportSummary summary)
+    {
+        var result = new List<RhinoBimObject>();
+
+        foreach (var obj in objects)
+        {
+            var classification = ResolveClassification(obj, options.DefaultIfcType);
+            obj.IfcType = classification.IfcType;
+            obj.IfcPredefinedType = GetUserText(obj, "IfcPredefinedType", classification.PredefinedType);
+            obj.IfcObjectType = GetUserText(obj, "IfcObjectType", classification.ObjectType);
+            obj.IfcGlobalId = ResolveGlobalId(obj);
+            obj.IfcName = GetUserText(obj, "IfcName", GetFirstUserText(obj, obj.ObjectName, "Panel_Name", "Panel Name", "Part_ID", "Part ID"));
+            obj.IfcDescription = GetUserText(obj, "IfcDescription", string.Empty);
+            obj.IfcStorey = GetUserText(obj, "IfcStorey", options.DefaultStorey);
+            obj.IfcMaterial = GetUserText(obj, "IfcMaterial", GetFirstUserText(obj, obj.RhinoMaterialName, "Material"));
+            obj.IfcPropertySetsJson = GetUserText(obj, "IfcPropertySetsJson", string.Empty);
+            obj.IfcFullDataJson = GetUserText(obj, "IfcFullDataJson", string.Empty);
+            obj.IsSupportedGeometry = obj.Geometry is Mesh or Brep or Extrusion or Surface or Curve;
+
+            if (obj.Geometry is Mesh)
+            {
+                summary.MeshObjects++;
+            }
+            else if (obj.Geometry is Brep or Extrusion or Surface or Curve)
+            {
+                summary.MeshObjects++;
+            }
+            else
+            {
+                obj.SkipReason = UnsupportedReason(obj.GeometryType);
+                IncrementUnsupported(summary, obj.GeometryType);
+                _log.Warning($"Skipping {obj.RhinoObjectId}: {obj.SkipReason}");
+                summary.WarningCount++;
+            }
+
+            result.Add(obj);
+        }
+
+        return result;
+    }
+
+    private static Classification ResolveClassification(RhinoBimObject obj, string defaultIfcType)
+    {
+        var fromLayerMapping = ResolveLayerClassification(obj);
+        var fromUserText = NormalizeIfcType(GetUserText(obj, "IfcType", string.Empty));
+        if (!string.IsNullOrEmpty(fromUserText))
+        {
+            return string.Equals(fromUserText, fromLayerMapping.IfcType, StringComparison.OrdinalIgnoreCase)
+                ? new Classification(fromUserText, fromLayerMapping.PredefinedType, fromLayerMapping.ObjectType)
+                : new Classification(fromUserText, string.Empty, string.Empty);
+        }
+
+        if (!string.IsNullOrEmpty(fromLayerMapping.IfcType))
+        {
+            return fromLayerMapping;
+        }
+
+        var fromLayer = FindSupportedIfcType(GetLayerSearchText(obj));
+        if (!string.IsNullOrEmpty(fromLayer))
+        {
+            return new Classification(fromLayer, string.Empty, string.Empty);
+        }
+
+        var fromName = ResolveNamePrefix(obj.ObjectName);
+        if (!string.IsNullOrEmpty(fromName))
+        {
+            return new Classification(fromName, string.Empty, string.Empty);
+        }
+
+        var fallback = NormalizeIfcType(defaultIfcType) is { Length: > 0 } normalizedDefault
+            ? normalizedDefault
+            : "IfcBuildingElementProxy";
+        return new Classification(fallback, string.Empty, string.Empty);
+    }
+
+    private static Classification ResolveLayerClassification(RhinoBimObject obj)
+    {
+        var layerText = GetLayerSearchText(obj);
+        if (ContainsAny(layerText, "stiffener", "stiffeners"))
+        {
+            return new Classification("IfcMember", "USERDEFINED", "Stiffener");
+        }
+
+        if (ContainsAny(layerText, "angle", "angles", "bracket", "brackets", "fixing"))
+        {
+            return new Classification("IfcMember", "USERDEFINED", "L-Angle");
+        }
+
+        if (ContainsAny(layerText, "panel", "panels", "cladding", "clad", "sheet", "sheets"))
+        {
+            return new Classification("IfcCovering", "CLADDING", "Cladding Sheet");
+        }
+
+        return Classification.Empty;
+    }
+
+    private static string GetLayerSearchText(RhinoBimObject obj)
+    {
+        return string.Join(" ", obj.LayerName, string.Join(" ", obj.AdditionalLayerNames));
+    }
+
+    private static bool ContainsAny(string text, params string[] tokens)
+    {
+        return !string.IsNullOrWhiteSpace(text) &&
+            tokens.Any(token => text.Contains(token, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private string ResolveGlobalId(RhinoBimObject obj)
+    {
+        var provided = GetUserText(obj, "IfcGlobalId", string.Empty);
+        if (IsValidCompressedIfcGlobalId(provided))
+        {
+            return provided;
+        }
+
+        if (!string.IsNullOrWhiteSpace(provided))
+        {
+            _log.Warning($"Object {obj.RhinoObjectId} has invalid IfcGlobalId '{provided}'. A new GlobalId was generated.");
+        }
+
+        return IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+    }
+
+    private static string GetUserText(RhinoBimObject obj, string key, string fallback)
+    {
+        return obj.UserText.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value.Trim()
+            : fallback;
+    }
+
+    private static string GetFirstUserText(RhinoBimObject obj, string fallback, params string[] keys)
+    {
+        foreach (var key in keys)
+        {
+            if (obj.UserText.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value))
+            {
+                return value.Trim();
+            }
+        }
+
+        return fallback;
+    }
+
+    private static string NormalizeIfcType(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var trimmed = value.Trim();
+        if (trimmed.Equals("IfcWallStandardCase", StringComparison.OrdinalIgnoreCase))
+        {
+            return "IfcWall";
+        }
+
+        return SupportedIfcTypes.FirstOrDefault(type => type.Equals(trimmed, StringComparison.OrdinalIgnoreCase)) ?? string.Empty;
+    }
+
+    private static string FindSupportedIfcType(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        return SupportedIfcTypes.FirstOrDefault(type => text.Contains(type, StringComparison.OrdinalIgnoreCase)) ?? string.Empty;
+    }
+
+    private static string ResolveNamePrefix(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return string.Empty;
+        }
+
+        var prefix = name.Split(['_', '-', ' ', ':', '.'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
+        return NormalizeIfcType(prefix);
+    }
+
+    private static bool IsValidCompressedIfcGlobalId(string value)
+    {
+        return value.Length == 22 && value.All(c => char.IsLetterOrDigit(c) || c is '_' or '$');
+    }
+
+    private static string UnsupportedReason(string geometryType)
+    {
+        return geometryType switch
+        {
+            "Brep" => "Brep geometry could not be converted to an exportable tessellation.",
+            "Surface" => "Surface geometry could not be converted to an exportable tessellation.",
+            "Extrusion" => "Extrusion geometry could not be converted to an exportable tessellation.",
+            "Curve" => "Curve geometry could not be converted to an exportable IFC polyline.",
+            _ => $"{geometryType} geometry is not supported in Version 1."
+        };
+    }
+
+    private static void IncrementUnsupported(ExportSummary summary, string geometryType)
+    {
+        switch (geometryType)
+        {
+            case "Brep":
+                summary.UnsupportedBrepObjects++;
+                break;
+            case "Surface":
+                summary.UnsupportedSurfaceObjects++;
+                break;
+            case "Extrusion":
+                summary.UnsupportedExtrusionObjects++;
+                break;
+            default:
+                summary.UnsupportedOtherObjects++;
+                break;
+        }
+    }
+
+    private sealed record Classification(string IfcType, string PredefinedType, string ObjectType)
+    {
+        public static Classification Empty { get; } = new(string.Empty, string.Empty, string.Empty);
+    }
+}
+}
+
+// -----------------------------------------------------------------------------
+// Source: Services/IfcPropertySetBuilder.cs
+// -----------------------------------------------------------------------------
+namespace Rhino3dmToIfc.Console.Services
+{
+public sealed class IfcPropertySetBuilder
+{
+    private static readonly HashSet<string> InternalUserTextKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "IfcPropertySetsJson",
+        "IfcFullDataJson"
+    };
+
+    private static readonly HashSet<string> MappedUserTextKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Panel_Name",
+        "Panel Name",
+        "Material",
+        "Thickness",
+        "Width",
+        "Length",
+        "Depth",
+        "Qty",
+        "Quantity",
+        "Count",
+        "Installation",
+        "Screw",
+        "Tape",
+        "pop rivet",
+        "PopRivet",
+        "Pop Rivet",
+        "Geo Type",
+        "GeoType",
+        "Panel_Plane",
+        "Panel Plane",
+        "_PancakeGenerated"
+    };
+
+    private readonly LogService _log;
+
+    public IfcPropertySetBuilder(LogService log)
+    {
+        _log = log;
+    }
+
+    public void AttachPropertySets(IfcProduct product, RhinoBimObject source, ExportSummary summary)
+    {
+        var model = product.Model;
+        var sourceProperties = new Dictionary<string, object?>
+        {
+            ["SourceRhinoObjectId"] = source.RhinoObjectId.ToString(),
+            ["SourceLayer"] = source.LayerName,
+            ["SourceAdditionalLayers"] = string.Join("; ", source.AdditionalLayerNames),
+            ["SourceGeometryType"] = source.GeometryType,
+            ["ExportedBy"] = "Rhino3dmToIfc.Console",
+            ["ExportedAtUtc"] = DateTimeOffset.UtcNow.ToString("O")
+        };
+        AddGeometryProperties(sourceProperties, source.Geometry);
+
+        AttachPropertySet(product, "Pset_RhinoSource", sourceProperties);
+        AttachRhinoUserText(product, source);
+        AttachFabricationProperties(product, source);
+        AttachFabricationQuantities(product, source);
+
+        if (string.IsNullOrWhiteSpace(source.IfcPropertySetsJson))
+        {
+            return;
+        }
+
+        try
+        {
+            var root = JObject.Parse(source.IfcPropertySetsJson);
+            foreach (var propertySet in root.Properties())
+            {
+                if (propertySet.Value is not JObject propertyObject)
+                {
+                    _log.Warning($"Ignoring custom property set '{propertySet.Name}' on {source.RhinoObjectId}; expected an object.");
+                    summary.WarningCount++;
+                    continue;
+                }
+
+                var values = propertyObject.Properties()
+                    .Where(property => IsSupportedValue(property.Value))
+                    .ToDictionary(property => property.Name, property => ConvertJsonValue(property.Value), StringComparer.OrdinalIgnoreCase);
+
+                if (values.Count > 0)
+                {
+                    AttachPropertySet(product, propertySet.Name, values);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            summary.WarningCount++;
+            _log.Warning($"Invalid IfcPropertySetsJson on {source.RhinoObjectId}. Custom properties were skipped. {ex.Message}");
+        }
+    }
+
+    private static void AttachRhinoUserText(IfcProduct product, RhinoBimObject source)
+    {
+        var values = source.UserText
+            .Where(pair => !InternalUserTextKeys.Contains(pair.Key) &&
+                !MappedUserTextKeys.Contains(pair.Key) &&
+                !string.IsNullOrWhiteSpace(pair.Value))
+            .ToDictionary(pair => pair.Key, pair => (object?)pair.Value.Trim(), StringComparer.OrdinalIgnoreCase);
+
+        if (values.Count > 0)
+        {
+            AttachPropertySet(product, "Pset_RhinoUserText", values);
+        }
+    }
+
+    private static void AttachFabricationProperties(IfcProduct product, RhinoBimObject source)
+    {
+        var values = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        AddTextIfPresent(values, "PanelName", source, "Panel_Name", "Panel Name");
+        AddTextIfPresent(values, "Material", source, "Material");
+        AddNumberIfPresent(values, "Thickness", source, "Thickness");
+        AddNumberIfPresent(values, "Width", source, "Width");
+        AddNumberIfPresent(values, "Length", source, "Length");
+        AddNumberIfPresent(values, "Depth", source, "Depth");
+        AddNumberIfPresent(values, "Quantity", source, "Qty", "Quantity", "Count");
+        AddTextIfPresent(values, "Installation", source, "Installation");
+        AddTextIfPresent(values, "Screw", source, "Screw");
+        AddTextIfPresent(values, "Tape", source, "Tape");
+        AddTextIfPresent(values, "PopRivet", source, "pop rivet", "PopRivet", "Pop Rivet");
+        AddTextIfPresent(values, "GeoType", source, "Geo Type", "GeoType");
+        AddTextIfPresent(values, "PanelPlane", source, "Panel_Plane", "Panel Plane");
+        AddTextIfPresent(values, "PancakeGenerated", source, "_PancakeGenerated");
+
+        if (values.Count > 0)
+        {
+            AttachPropertySet(product, "Pset_Fabrication", values);
+        }
+    }
+
+    private static void AttachFabricationQuantities(IfcProduct product, RhinoBimObject source)
+    {
+        var quantities = new List<IfcPhysicalQuantity>();
+        AddLengthQuantity(product, quantities, source, "Thickness", "Thickness");
+        AddLengthQuantity(product, quantities, source, "Width", "Width");
+        AddLengthQuantity(product, quantities, source, "Length", "Length");
+        AddLengthQuantity(product, quantities, source, "Depth", "Depth");
+        AddCountQuantity(product, quantities, source, "Quantity", "Qty", "Quantity", "Count");
+
+        if (TryGetNumber(source, out var length, "Length") && TryGetNumber(source, out var width, "Width"))
+        {
+            var area = product.Model.Instances.New<IfcQuantityArea>();
+            area.Name = "GrossArea";
+            area.AreaValue = new IfcAreaMeasure(length * width);
+            area.Formula = "Length * Width";
+            quantities.Add(area);
+
+            if (TryGetNumber(source, out var thickness, "Thickness"))
+            {
+                var volume = product.Model.Instances.New<IfcQuantityVolume>();
+                volume.Name = "GrossVolume";
+                volume.VolumeValue = new IfcVolumeMeasure(length * width * thickness);
+                volume.Formula = "Length * Width * Thickness";
+                quantities.Add(volume);
+            }
+        }
+
+        if (quantities.Count > 0)
+        {
+            AttachQuantitySet(product, "Qto_FabricationBaseQuantities", quantities);
+        }
+    }
+
+    private static void AddTextIfPresent(Dictionary<string, object?> values, string outputName, RhinoBimObject source, params string[] sourceKeys)
+    {
+        if (TryGetUserText(source, out var value, sourceKeys))
+        {
+            values[outputName] = value;
+        }
+    }
+
+    private static void AddNumberIfPresent(Dictionary<string, object?> values, string outputName, RhinoBimObject source, params string[] sourceKeys)
+    {
+        if (TryGetNumber(source, out var value, sourceKeys))
+        {
+            values[outputName] = value;
+        }
+    }
+
+    private static void AddLengthQuantity(IfcProduct product, List<IfcPhysicalQuantity> quantities, RhinoBimObject source, string quantityName, params string[] sourceKeys)
+    {
+        if (!TryGetNumber(source, out var value, sourceKeys))
+        {
+            return;
+        }
+
+        var quantity = product.Model.Instances.New<IfcQuantityLength>();
+        quantity.Name = quantityName;
+        quantity.LengthValue = new IfcLengthMeasure(value);
+        quantities.Add(quantity);
+    }
+
+    private static void AddCountQuantity(IfcProduct product, List<IfcPhysicalQuantity> quantities, RhinoBimObject source, string quantityName, params string[] sourceKeys)
+    {
+        if (!TryGetNumber(source, out var value, sourceKeys))
+        {
+            return;
+        }
+
+        var quantity = product.Model.Instances.New<IfcQuantityCount>();
+        quantity.Name = quantityName;
+        quantity.CountValue = new IfcCountMeasure(value);
+        quantities.Add(quantity);
+    }
+
+    private static void AttachPropertySet(IfcProduct product, string propertySetName, IReadOnlyDictionary<string, object?> values)
+    {
+        var model = product.Model;
+        var propertySet = model.Instances.New<IfcPropertySet>();
+        propertySet.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        propertySet.Name = propertySetName;
+
+        foreach (var (name, value) in values)
+        {
+            var property = model.Instances.New<IfcPropertySingleValue>();
+            property.Name = name;
+            property.NominalValue = ToIfcValue(value);
+            propertySet.HasProperties.Add(property);
+        }
+
+        var relation = model.Instances.New<IfcRelDefinesByProperties>();
+        relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        relation.RelatingPropertyDefinition = propertySet;
+        relation.RelatedObjects.Add(product);
+    }
+
+    private static void AttachQuantitySet(IfcProduct product, string quantitySetName, IReadOnlyCollection<IfcPhysicalQuantity> quantities)
+    {
+        var model = product.Model;
+        var quantitySet = model.Instances.New<IfcElementQuantity>();
+        quantitySet.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        quantitySet.Name = quantitySetName;
+        quantitySet.MethodOfMeasurement = "Rhino user text";
+
+        foreach (var quantity in quantities)
+        {
+            quantitySet.Quantities.Add(quantity);
+        }
+
+        var relation = model.Instances.New<IfcRelDefinesByProperties>();
+        relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        relation.RelatingPropertyDefinition = quantitySet;
+        relation.RelatedObjects.Add(product);
+    }
+
+    private static void AddGeometryProperties(Dictionary<string, object?> target, object? geometry)
+    {
+        if (geometry is not GeometryBase geometryBase)
+        {
+            return;
+        }
+
+        var bounds = geometryBase.GetBoundingBox(true);
+        if (bounds.IsValid)
+        {
+            target["BoundingBoxMinX"] = bounds.Min.X;
+            target["BoundingBoxMinY"] = bounds.Min.Y;
+            target["BoundingBoxMinZ"] = bounds.Min.Z;
+            target["BoundingBoxMaxX"] = bounds.Max.X;
+            target["BoundingBoxMaxY"] = bounds.Max.Y;
+            target["BoundingBoxMaxZ"] = bounds.Max.Z;
+            target["ApproxWidthX"] = bounds.Max.X - bounds.Min.X;
+            target["ApproxDepthY"] = bounds.Max.Y - bounds.Min.Y;
+            target["ApproxHeightZ"] = bounds.Max.Z - bounds.Min.Z;
+        }
+
+        switch (geometry)
+        {
+            case Mesh mesh:
+                target["MeshVertexCount"] = mesh.Vertices.Count;
+                target["MeshFaceCount"] = mesh.Faces.Count;
+                target["MeshIsClosed"] = mesh.IsClosed;
+                break;
+            case Brep brep:
+                target["BrepFaceCount"] = brep.Faces.Count;
+                target["BrepEdgeCount"] = brep.Edges.Count;
+                target["BrepIsSolid"] = brep.IsSolid;
+                break;
+            case Extrusion extrusion:
+                target["ExtrusionIsSolid"] = extrusion.IsSolid;
+                break;
+            case Curve curve:
+                target["CurveIsClosed"] = curve.IsClosed;
+                break;
+            case Surface surface:
+                target["SurfaceIsClosedU"] = surface.IsClosed(0);
+                target["SurfaceIsClosedV"] = surface.IsClosed(1);
+                break;
+        }
+    }
+
+    private static bool IsSupportedValue(JToken token)
+    {
+        return token.Type is JTokenType.String or JTokenType.Integer or JTokenType.Float or JTokenType.Boolean;
+    }
+
+    private static object? ConvertJsonValue(JToken token)
+    {
+        return token.Type switch
+        {
+            JTokenType.Boolean => token.Value<bool>(),
+            JTokenType.Integer => token.Value<long>(),
+            JTokenType.Float => token.Value<double>(),
+            _ => token.Value<string>()
+        };
+    }
+
+    private static bool TryGetUserText(RhinoBimObject source, out string value, params string[] keys)
+    {
+        foreach (var key in keys)
+        {
+            if (source.UserText.TryGetValue(key, out var candidate) && !string.IsNullOrWhiteSpace(candidate))
+            {
+                value = candidate.Trim();
+                return true;
+            }
+        }
+
+        value = string.Empty;
+        return false;
+    }
+
+    private static bool TryGetNumber(RhinoBimObject source, out double value, params string[] keys)
+    {
+        value = 0;
+        return TryGetUserText(source, out var text, keys) && TryParseNumber(text, out value);
+    }
+
+    private static bool TryParseNumber(string text, out double value)
+    {
+        value = 0;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var trimmed = text.Trim();
+        if (double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+        {
+            return true;
+        }
+
+        var normalized = trimmed.Replace(',', '.');
+        if (double.TryParse(normalized, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+        {
+            return true;
+        }
+
+        var match = Regex.Match(normalized, @"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?");
+        return match.Success && double.TryParse(match.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+    }
+
+    private static IfcValue ToIfcValue(object? value)
+    {
+        return value switch
+        {
+            bool boolValue => new IfcBoolean(boolValue),
+            int intValue => new IfcInteger(intValue),
+            long longValue when longValue is <= int.MaxValue and >= int.MinValue => new IfcInteger((int)longValue),
+            float floatValue => new IfcReal(floatValue),
+            double doubleValue => new IfcReal(doubleValue),
+            decimal decimalValue => new IfcReal((double)decimalValue),
+            _ => new IfcText(value?.ToString() ?? string.Empty)
+        };
+    }
+}
+}
+
+// -----------------------------------------------------------------------------
+// Source: Services/IfcGeometryBuilder.cs
+// -----------------------------------------------------------------------------
+namespace Rhino3dmToIfc.Console.Services
+{
+public sealed class IfcGeometryBuilder
+{
+    private readonly LogService _log;
+
+    public IfcGeometryBuilder(LogService log)
+    {
+        _log = log;
+    }
+
+    public bool TryAttachMeshRepresentation(
+        IfcProduct product,
+        RhinoBimObject source,
+        IfcGeometricRepresentationContext context,
+        IDictionary<string, IfcPresentationLayerAssignment> layers,
+        out string skipReason)
+    {
+        skipReason = string.Empty;
+
+        if (source.Geometry is Curve curve)
+        {
+            return TryAttachCurveRepresentation(product, source, curve, context, layers, out skipReason);
+        }
+
+        if (source.Geometry is Brep brep)
+        {
+            return TryAttachBrepPreferredRepresentation(product, source, brep, context, layers, out skipReason);
+        }
+
+        if (source.Geometry is Surface surface)
+        {
+            var surfaceBrep = surface.ToBrep();
+            if (surfaceBrep is not null)
+            {
+                return TryAttachBrepPreferredRepresentation(product, source, surfaceBrep, context, layers, out skipReason);
+            }
+        }
+
+        var mesh = ExtractMesh(source.Geometry);
+        if (mesh is null)
+        {
+            skipReason = source.Geometry switch
+            {
+                Extrusion => "Extrusion has no saved render/preview/analysis mesh and could not be converted to Brep topology.",
+                Surface => "Surface could not be converted to Brep or mesh geometry.",
+                _ => string.IsNullOrWhiteSpace(source.SkipReason) ? "Geometry could not be converted to an IFC representation." : source.SkipReason
+            };
+            _log.Warning($"Skipping {source.RhinoObjectId}: {skipReason}");
+            return false;
+        }
+
+        return TryAttachMesh(product, source, mesh, context, layers, out skipReason);
+    }
+
+    private bool TryAttachBrepPreferredRepresentation(
+        IfcProduct product,
+        RhinoBimObject source,
+        Brep brep,
+        IfcGeometricRepresentationContext context,
+        IDictionary<string, IfcPresentationLayerAssignment> layers,
+        out string skipReason)
+    {
+        if (TryAttachBrepPolygonalRepresentation(product, source, brep, context, layers, false, out skipReason))
+        {
+            return true;
+        }
+
+        var polygonalSkipReason = skipReason;
+        var fallbackMesh = ExtractBrepMesh(brep);
+        if (fallbackMesh is not null && TryAttachMesh(product, source, fallbackMesh, context, layers, out skipReason))
+        {
+            return true;
+        }
+
+        skipReason = string.IsNullOrWhiteSpace(skipReason) ? polygonalSkipReason : $"{polygonalSkipReason} Mesh fallback also failed: {skipReason}";
+        _log.Warning($"Skipping {source.RhinoObjectId}: {skipReason}");
+        return false;
+    }
+
+    private bool TryAttachMesh(
+        IfcProduct product,
+        RhinoBimObject source,
+        Mesh mesh,
+        IfcGeometricRepresentationContext context,
+        IDictionary<string, IfcPresentationLayerAssignment> layers,
+        out string skipReason)
+    {
+        skipReason = string.Empty;
+
+        if (mesh.Vertices.Count == 0 || mesh.Faces.Count == 0)
+        {
+            skipReason = "Mesh has no vertices or faces.";
+            _log.Warning($"Skipping {source.RhinoObjectId}: {skipReason}");
+            return false;
+        }
+
+        var exportMesh = PrepareMeshForExport(mesh);
+        var model = product.Model;
+        var pointList = model.Instances.New<IfcCartesianPointList3D>();
+        foreach (var vertex in exportMesh.Vertices)
+        {
+            var coords = pointList.CoordList.GetAt(pointList.CoordList.Count);
+            coords.Add(new IfcLengthMeasure(vertex.X));
+            coords.Add(new IfcLengthMeasure(vertex.Y));
+            coords.Add(new IfcLengthMeasure(vertex.Z));
+        }
+
+        var faceSet = model.Instances.New<IfcTriangulatedFaceSet>();
+        faceSet.Coordinates = pointList;
+        faceSet.Closed = exportMesh.IsClosed;
+
+        var triangleCount = 0;
+        foreach (var face in exportMesh.Faces)
+        {
+            if (face.IsTriangle)
+            {
+                AddTriangle(faceSet, face.A, face.B, face.C);
+                triangleCount++;
+            }
+            else if (face.IsQuad)
+            {
+                AddTriangle(faceSet, face.A, face.B, face.C);
+                AddTriangle(faceSet, face.A, face.C, face.D);
+                triangleCount += 2;
+            }
+        }
+
+        if (triangleCount == 0)
+        {
+            skipReason = "Mesh has no triangle or quad faces.";
+            _log.Warning($"Skipping {source.RhinoObjectId}: {skipReason}");
+            return false;
+        }
+
+        var shapeRepresentation = model.Instances.New<IfcShapeRepresentation>();
+        shapeRepresentation.ContextOfItems = context;
+        shapeRepresentation.RepresentationIdentifier = "Body";
+        shapeRepresentation.RepresentationType = "Tessellation";
+        shapeRepresentation.Items.Add(faceSet);
+        AssignToLayers(faceSet, source, layers);
+        AssignSurfaceStyle(faceSet, source);
+
+        var productShape = model.Instances.New<IfcProductDefinitionShape>();
+        productShape.Representations.Add(shapeRepresentation);
+        product.Representation = productShape;
+        return true;
+    }
+
+    private bool TryAttachBrepPolygonalRepresentation(
+        IfcProduct product,
+        RhinoBimObject source,
+        Brep brep,
+        IfcGeometricRepresentationContext context,
+        IDictionary<string, IfcPresentationLayerAssignment> layers,
+        bool logFailure,
+        out string skipReason)
+    {
+        skipReason = string.Empty;
+        var model = product.Model;
+        var pointList = model.Instances.New<IfcCartesianPointList3D>();
+        var pointIndex = new Dictionary<PointKey, int>();
+        var faceSet = model.Instances.New<IfcPolygonalFaceSet>();
+        faceSet.Coordinates = pointList;
+        faceSet.Closed = brep.IsSolid;
+
+        foreach (var face in brep.Faces)
+        {
+            var loops = GetFaceLoops(face);
+            if (loops.Count == 0 || loops[0].Count < 3)
+            {
+                continue;
+            }
+
+            var projectedLoops = ProjectLoops(loops);
+            if (projectedLoops.Count == 0 || projectedLoops[0].Count < 3)
+            {
+                continue;
+            }
+
+            if (projectedLoops.Count == 1)
+            {
+                var polygonalFace = model.Instances.New<IfcIndexedPolygonalFace>();
+                AddPolygonLoop(pointList, pointIndex, polygonalFace.CoordIndex, projectedLoops[0]);
+                faceSet.Faces.Add(polygonalFace);
+            }
+            else
+            {
+                var polygonalFace = model.Instances.New<IfcIndexedPolygonalFaceWithVoids>();
+                AddPolygonLoop(pointList, pointIndex, polygonalFace.CoordIndex, projectedLoops[0]);
+
+                for (var i = 1; i < projectedLoops.Count; i++)
+                {
+                    var inner = polygonalFace.InnerCoordIndices.GetAt(polygonalFace.InnerCoordIndices.Count);
+                    AddPolygonLoop(pointList, pointIndex, inner, projectedLoops[i]);
+                }
+
+                faceSet.Faces.Add(polygonalFace);
+            }
+        }
+
+        if (faceSet.Faces.Count == 0)
+        {
+            skipReason = "Brep has no exportable polygonal faces.";
+            if (logFailure)
+            {
+                _log.Warning($"Skipping {source.RhinoObjectId}: {skipReason}");
+            }
+
+            return false;
+        }
+
+        var shapeRepresentation = model.Instances.New<IfcShapeRepresentation>();
+        shapeRepresentation.ContextOfItems = context;
+        shapeRepresentation.RepresentationIdentifier = "Body";
+        shapeRepresentation.RepresentationType = "Tessellation";
+        shapeRepresentation.Items.Add(faceSet);
+        AssignToLayers(faceSet, source, layers);
+        AssignSurfaceStyle(faceSet, source);
+
+        var productShape = model.Instances.New<IfcProductDefinitionShape>();
+        productShape.Representations.Add(shapeRepresentation);
+        product.Representation = productShape;
+        return true;
+    }
+
+    private static void AddPolygonLoop(
+        IfcCartesianPointList3D pointList,
+        Dictionary<PointKey, int> pointIndex,
+        Xbim.Common.IItemSet<IfcPositiveInteger> target,
+        List<ProjectedPoint> loop)
+    {
+        foreach (var projectedPoint in loop)
+        {
+            target.Add(new IfcPositiveInteger(GetOrAddPointIndex(pointList, pointIndex, projectedPoint.Point)));
+        }
+    }
+
+    private bool TryAttachCurveRepresentation(
+        IfcProduct product,
+        RhinoBimObject source,
+        Curve curve,
+        IfcGeometricRepresentationContext context,
+        IDictionary<string, IfcPresentationLayerAssignment> layers,
+        out string skipReason)
+    {
+        skipReason = string.Empty;
+        var points = GetCurvePolylinePoints(curve);
+        if (points.Count < 2)
+        {
+            skipReason = "Curve is invalid or has fewer than two exportable points.";
+            _log.Warning($"Skipping {source.RhinoObjectId}: {skipReason}");
+            return false;
+        }
+
+        var model = product.Model;
+        var polyline = model.Instances.New<IfcPolyline>();
+        foreach (var point in points)
+        {
+            var ifcPoint = model.Instances.New<IfcCartesianPoint>();
+            ifcPoint.SetXYZ(point.X, point.Y, point.Z);
+            polyline.Points.Add(ifcPoint);
+        }
+
+        AssignToLayers(polyline, source, layers);
+        AssignCurveStyle(polyline, source);
+
+        var shapeRepresentation = model.Instances.New<IfcShapeRepresentation>();
+        shapeRepresentation.ContextOfItems = context;
+        shapeRepresentation.RepresentationIdentifier = "Axis";
+        shapeRepresentation.RepresentationType = "Curve3D";
+        shapeRepresentation.Items.Add(polyline);
+
+        var productShape = model.Instances.New<IfcProductDefinitionShape>();
+        productShape.Representations.Add(shapeRepresentation);
+        product.Representation = productShape;
+        return true;
+    }
+
+    private static void AssignToLayers(IfcRepresentationItem item, RhinoBimObject source, IDictionary<string, IfcPresentationLayerAssignment> layers)
+    {
+        foreach (var layerName in GetObjectLayerNames(source))
+        {
+            AssignToLayer(item, layerName, layers);
+        }
+    }
+
+    private static void AssignSurfaceStyle(IfcRepresentationItem item, RhinoBimObject source)
+    {
+        if (!TryGetDisplayColor(source, out var red, out var green, out var blue))
+        {
+            return;
+        }
+
+        var model = item.Model;
+        var color = CreateColour(model, red, green, blue);
+        var rendering = model.Instances.New<IfcSurfaceStyleRendering>();
+        rendering.SurfaceColour = color;
+        rendering.DiffuseColour = color;
+        rendering.ReflectanceMethod = Xbim.Ifc4.Interfaces.IfcReflectanceMethodEnum.NOTDEFINED;
+        if (source.DisplayTransparency is { } transparency)
+        {
+            rendering.Transparency = new IfcNormalisedRatioMeasure(Clamp01(transparency));
+        }
+
+        var surfaceStyle = model.Instances.New<IfcSurfaceStyle>();
+        surfaceStyle.Name = string.IsNullOrWhiteSpace(source.DisplayColorName) ? "Rhino display color" : source.DisplayColorName;
+        surfaceStyle.Side = Xbim.Ifc4.Interfaces.IfcSurfaceSide.BOTH;
+        surfaceStyle.Styles.Add(rendering);
+
+        var styleAssignment = model.Instances.New<IfcPresentationStyleAssignment>();
+        styleAssignment.Styles.Add(surfaceStyle);
+
+        var styledItem = model.Instances.New<IfcStyledItem>();
+        styledItem.Item = item;
+        styledItem.Name = surfaceStyle.Name;
+        styledItem.Styles.Add(styleAssignment);
+    }
+
+    private static void AssignCurveStyle(IfcRepresentationItem item, RhinoBimObject source)
+    {
+        if (!TryGetDisplayColor(source, out var red, out var green, out var blue))
+        {
+            return;
+        }
+
+        var model = item.Model;
+        var curveStyle = model.Instances.New<IfcCurveStyle>();
+        curveStyle.Name = string.IsNullOrWhiteSpace(source.DisplayColorName) ? "Rhino display color" : source.DisplayColorName;
+        curveStyle.CurveColour = CreateColour(model, red, green, blue);
+        curveStyle.ModelOrDraughting = new IfcBoolean(true);
+
+        var styleAssignment = model.Instances.New<IfcPresentationStyleAssignment>();
+        styleAssignment.Styles.Add(curveStyle);
+
+        var styledItem = model.Instances.New<IfcStyledItem>();
+        styledItem.Item = item;
+        styledItem.Name = curveStyle.Name;
+        styledItem.Styles.Add(styleAssignment);
+    }
+
+    private static IfcColourRgb CreateColour(Xbim.Common.IModel model, byte red, byte green, byte blue)
+    {
+        var color = model.Instances.New<IfcColourRgb>();
+        color.Red = new IfcNormalisedRatioMeasure(red / 255.0);
+        color.Green = new IfcNormalisedRatioMeasure(green / 255.0);
+        color.Blue = new IfcNormalisedRatioMeasure(blue / 255.0);
+        return color;
+    }
+
+    private static bool TryGetDisplayColor(RhinoBimObject source, out byte red, out byte green, out byte blue)
+    {
+        if (source.DisplayColorRed is { } r && source.DisplayColorGreen is { } g && source.DisplayColorBlue is { } b)
+        {
+            red = r;
+            green = g;
+            blue = b;
+            return true;
+        }
+
+        red = 0;
+        green = 0;
+        blue = 0;
+        return false;
+    }
+
+    private static double Clamp01(double value)
+    {
+        return Math.Max(0.0, Math.Min(1.0, value));
+    }
+
+    private static IEnumerable<string> GetObjectLayerNames(RhinoBimObject source)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var primaryLayerName = string.IsNullOrWhiteSpace(source.LayerName) ? "Default" : source.LayerName.Trim();
+        if (seen.Add(primaryLayerName))
+        {
+            yield return primaryLayerName;
+        }
+
+        foreach (var layerName in source.AdditionalLayerNames)
+        {
+            if (!string.IsNullOrWhiteSpace(layerName) && seen.Add(layerName.Trim()))
+            {
+                yield return layerName.Trim();
+            }
+        }
+    }
+
+    private static void AssignToLayer(IfcRepresentationItem item, string layerName, IDictionary<string, IfcPresentationLayerAssignment> layers)
+    {
+        var cleanLayerName = string.IsNullOrWhiteSpace(layerName) ? "Default" : layerName.Trim();
+        foreach (var layerPath in GetLayerPathNames(cleanLayerName))
+        {
+            if (!layers.TryGetValue(layerPath, out var layer))
+            {
+                layer = item.Model.Instances.New<IfcPresentationLayerAssignment>();
+                layer.Name = layerPath;
+                layer.Identifier = layerPath;
+                layer.Description = $"Rhino layer: {layerPath}";
+                layers[layerPath] = layer;
+            }
+
+            layer.AssignedItems.Add(item);
+        }
+    }
+
+    private static IEnumerable<string> GetLayerPathNames(string layerName)
+    {
+        var parts = layerName.Split("::", StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0)
+        {
+            yield return "Default";
+            yield break;
+        }
+
+        var current = string.Empty;
+        foreach (var part in parts)
+        {
+            current = string.IsNullOrWhiteSpace(current) ? part : $"{current}::{part}";
+            yield return current;
+        }
+    }
+
+    private static void AddTriangle(IfcTriangulatedFaceSet faceSet, int a, int b, int c)
+    {
+        var indices = faceSet.CoordIndex.GetAt(faceSet.CoordIndex.Count);
+        indices.Add(new IfcPositiveInteger(a + 1));
+        indices.Add(new IfcPositiveInteger(b + 1));
+        indices.Add(new IfcPositiveInteger(c + 1));
+    }
+
+    private static Mesh PrepareMeshForExport(Mesh mesh)
+    {
+        var exportMesh = mesh.DuplicateMesh();
+        exportMesh.Faces.ConvertQuadsToTriangles();
+        exportMesh.Vertices.CombineIdentical(true, true);
+        exportMesh.Vertices.CullUnused();
+        exportMesh.Compact();
+        return exportMesh;
+    }
+
+    private static Mesh? ExtractMesh(object? geometry)
+    {
+        return geometry switch
+        {
+            Mesh mesh => DuplicateMesh(mesh),
+            Extrusion extrusion => DuplicateMesh(GetFirstMesh(
+                () => extrusion.GetMesh(MeshType.Render),
+                () => extrusion.GetMesh(MeshType.Preview),
+                () => extrusion.GetMesh(MeshType.Analysis),
+                () => extrusion.GetMesh(MeshType.Any),
+                () => extrusion.GetMesh(MeshType.Default))) ?? ExtractBrepMesh(extrusion.ToBrep()),
+            _ => null
+        };
+    }
+
+    private static Mesh? ExtractBrepMesh(Brep? brep)
+    {
+        if (brep is null)
+        {
+            return null;
+        }
+
+        var meshes = new List<Mesh>();
+        foreach (var face in brep.Faces)
+        {
+            var mesh = GetFirstMesh(
+                () => face.GetMesh(MeshType.Render),
+                () => face.GetMesh(MeshType.Preview),
+                () => face.GetMesh(MeshType.Analysis),
+                () => face.GetMesh(MeshType.Any),
+                () => face.GetMesh(MeshType.Default));
+
+            var duplicate = DuplicateMesh(mesh);
+            if (duplicate is not null && duplicate.Vertices.Count > 0 && duplicate.Faces.Count > 0)
+            {
+                meshes.Add(duplicate);
+            }
+        }
+
+        if (meshes.Count == 0)
+        {
+            return null;
+        }
+
+        var combined = new Mesh();
+        combined.Append(meshes);
+        combined.Faces.ConvertQuadsToTriangles();
+        combined.Vertices.CombineIdentical(true, true);
+        combined.Vertices.CullUnused();
+        combined.Compact();
+        return combined;
+    }
+
+    private static Mesh? BuildMeshFromBrepTopology(Brep brep)
+    {
+        var mesh = new Mesh();
+
+        foreach (var face in brep.Faces)
+        {
+            var loops = GetFaceLoops(face);
+            if (loops.Count == 0 || loops[0].Count < 3)
+            {
+                continue;
+            }
+
+            var projected = ProjectLoops(loops);
+            var polygon = MergeHoles(projected);
+            var triangles = EarClip(polygon);
+            if (triangles.Count == 0)
+            {
+                continue;
+            }
+
+            var startIndex = mesh.Vertices.Count;
+            foreach (var point in polygon)
+            {
+                mesh.Vertices.Add(point.Point);
+            }
+
+            foreach (var triangle in triangles)
+            {
+                mesh.Faces.AddFace(startIndex + triangle.A, startIndex + triangle.B, startIndex + triangle.C);
+            }
+        }
+
+        if (mesh.Vertices.Count == 0 || mesh.Faces.Count == 0)
+        {
+            return null;
+        }
+
+        mesh.Compact();
+        return mesh;
+    }
+
+    private static List<List<Point3d>> GetFaceLoops(BrepFace face)
+    {
+        var outerLoops = new List<List<Point3d>>();
+        var innerLoops = new List<List<Point3d>>();
+
+        foreach (var loop in face.Loops)
+        {
+            var points = GetLoopPoints(loop);
+            if (points.Count < 3)
+            {
+                continue;
+            }
+
+            if (loop.LoopType == BrepLoopType.Inner)
+            {
+                innerLoops.Add(points);
+            }
+            else if (loop.LoopType == BrepLoopType.Outer)
+            {
+                outerLoops.Add(points);
+            }
+        }
+
+        if (outerLoops.Count == 0 && face.OuterLoop is not null)
+        {
+            var fallback = GetLoopPoints(face.OuterLoop);
+            if (fallback.Count >= 3)
+            {
+                outerLoops.Add(fallback);
+            }
+        }
+
+        var result = new List<List<Point3d>>();
+        result.AddRange(outerLoops);
+        result.AddRange(innerLoops);
+        return result;
+    }
+
+    private static List<Point3d> GetLoopPoints(BrepLoop loop)
+    {
+        var points = new List<Point3d>();
+
+        foreach (var trim in loop.Trims)
+        {
+            var sampled = SampleTrimCurve(trim);
+            if (sampled.Count >= 3)
+            {
+                foreach (var point in sampled)
+                {
+                    AddDistinctPoint(points, point);
+                }
+
+                continue;
+            }
+
+            var start = trim.StartVertex.Location;
+            var end = trim.EndVertex.Location;
+
+            if (points.Count == 0)
+            {
+                AddDistinctPoint(points, start);
+                AddDistinctPoint(points, end);
+                continue;
+            }
+
+            if (IsNear(points[^1], start))
+            {
+                AddDistinctPoint(points, end);
+            }
+            else if (IsNear(points[^1], end))
+            {
+                AddDistinctPoint(points, start);
+            }
+            else
+            {
+                AddDistinctPoint(points, start);
+                AddDistinctPoint(points, end);
+            }
+        }
+
+        RemoveClosingDuplicate(points);
+        RemoveCollinear(points);
+        return points;
+    }
+
+    private static List<Point3d> SampleTrimCurve(BrepTrim trim)
+    {
+        var curve = trim.Edge?.EdgeCurve;
+        if (curve is null || !curve.IsClosed)
+        {
+            return [];
+        }
+
+        if (curve.TryGetPolyline(out var polyline) && polyline.Count >= 4)
+        {
+            var points = polyline.ToList();
+            RemoveClosingDuplicate(points);
+            RemoveCollinear(points);
+            return points;
+        }
+
+        const int sampleCount = 24;
+        var domain = curve.Domain;
+        var sampled = new List<Point3d>();
+        for (var i = 0; i < sampleCount; i++)
+        {
+            var t = domain.T0 + ((domain.T1 - domain.T0) * i / sampleCount);
+            AddDistinctPoint(sampled, curve.PointAt(t));
+        }
+
+        RemoveClosingDuplicate(sampled);
+        RemoveCollinear(sampled);
+        return sampled.Count >= 3 ? sampled : [];
+    }
+
+    private static List<Point3d> GetCurvePolylinePoints(Curve curve)
+    {
+        if (!curve.IsValid)
+        {
+            return [];
+        }
+
+        if (curve.TryGetPolyline(out var polyline) && polyline.Count >= 2)
+        {
+            return CleanPolylinePoints(polyline);
+        }
+
+        if (curve is LineCurve lineCurve)
+        {
+            return CleanPolylinePoints([lineCurve.Line.From, lineCurve.Line.To]);
+        }
+
+        var domain = curve.Domain;
+        if (domain.T1 <= domain.T0)
+        {
+            return [];
+        }
+
+        const int segmentCount = 48;
+        var points = new List<Point3d>();
+        for (var i = 0; i <= segmentCount; i++)
+        {
+            var t = domain.T0 + ((domain.T1 - domain.T0) * i / segmentCount);
+            points.Add(curve.PointAt(t));
+        }
+
+        return CleanPolylinePoints(points);
+    }
+
+    private static List<Point3d> CleanPolylinePoints(IEnumerable<Point3d> source)
+    {
+        var points = new List<Point3d>();
+        foreach (var point in source)
+        {
+            AddDistinctPoint(points, point);
+        }
+
+        return points;
+    }
+
+    private static int GetOrAddPointIndex(
+        IfcCartesianPointList3D pointList,
+        Dictionary<PointKey, int> pointIndex,
+        Point3d point)
+    {
+        var key = PointKey.From(point);
+        if (pointIndex.TryGetValue(key, out var existing))
+        {
+            return existing;
+        }
+
+        var coords = pointList.CoordList.GetAt(pointList.CoordList.Count);
+        coords.Add(new IfcLengthMeasure(point.X));
+        coords.Add(new IfcLengthMeasure(point.Y));
+        coords.Add(new IfcLengthMeasure(point.Z));
+
+        var index = pointList.CoordList.Count;
+        pointIndex[key] = index;
+        return index;
+    }
+
+    private static List<List<ProjectedPoint>> ProjectLoops(List<List<Point3d>> loops)
+    {
+        var normal = GetNormal(loops[0]);
+        var dropAxis = GetDropAxis(normal);
+        var projected = loops
+            .Select(loop => loop.Select(point => Project(point, dropAxis)).ToList())
+            .Where(loop => loop.Count >= 3)
+            .ToList();
+
+        if (projected.Count == 0)
+        {
+            return projected;
+        }
+
+        if (SignedArea(projected[0]) < 0)
+        {
+            projected[0].Reverse();
+        }
+
+        for (var i = 1; i < projected.Count; i++)
+        {
+            if (SignedArea(projected[i]) > 0)
+            {
+                projected[i].Reverse();
+            }
+        }
+
+        return projected;
+    }
+
+    private static Vector3d GetNormal(List<Point3d> points)
+    {
+        for (var i = 0; i < points.Count - 2; i++)
+        {
+            var a = points[i + 1] - points[i];
+            var b = points[i + 2] - points[i];
+            var normal = Vector3d.CrossProduct(a, b);
+            if (normal.SquareLength > 1e-12)
+            {
+                normal.Unitize();
+                return normal;
+            }
+        }
+
+        return new Vector3d(0, 0, 1);
+    }
+
+    private static int GetDropAxis(Vector3d normal)
+    {
+        var ax = Math.Abs(normal.X);
+        var ay = Math.Abs(normal.Y);
+        var az = Math.Abs(normal.Z);
+
+        if (ax >= ay && ax >= az)
+        {
+            return 0;
+        }
+
+        return ay >= az ? 1 : 2;
+    }
+
+    private static ProjectedPoint Project(Point3d point, int dropAxis)
+    {
+        return dropAxis switch
+        {
+            0 => new ProjectedPoint(point, point.Y, point.Z),
+            1 => new ProjectedPoint(point, point.X, point.Z),
+            _ => new ProjectedPoint(point, point.X, point.Y)
+        };
+    }
+
+    private static List<ProjectedPoint> MergeHoles(List<List<ProjectedPoint>> loops)
+    {
+        var polygon = loops[0].ToList();
+        for (var i = 1; i < loops.Count; i++)
+        {
+            polygon = BridgeHole(polygon, loops[i], loops);
+        }
+
+        return polygon;
+    }
+
+    private static List<ProjectedPoint> BridgeHole(List<ProjectedPoint> outer, List<ProjectedPoint> hole, List<List<ProjectedPoint>> allLoops)
+    {
+        if (hole.Count < 3)
+        {
+            return outer;
+        }
+
+        var holeIndex = 0;
+        for (var i = 1; i < hole.Count; i++)
+        {
+            if (hole[i].X > hole[holeIndex].X || (Math.Abs(hole[i].X - hole[holeIndex].X) < 1e-9 && hole[i].Y < hole[holeIndex].Y))
+            {
+                holeIndex = i;
+            }
+        }
+
+        var bridgeIndex = FindBridgeVertex(outer, hole[holeIndex], allLoops);
+        var merged = new List<ProjectedPoint>();
+        for (var i = 0; i <= bridgeIndex; i++)
+        {
+            merged.Add(outer[i]);
+        }
+
+        for (var i = 0; i <= hole.Count; i++)
+        {
+            merged.Add(hole[(holeIndex + i) % hole.Count]);
+        }
+
+        merged.Add(outer[bridgeIndex]);
+        for (var i = bridgeIndex + 1; i < outer.Count; i++)
+        {
+            merged.Add(outer[i]);
+        }
+
+        return merged;
+    }
+
+    private static int FindBridgeVertex(List<ProjectedPoint> outer, ProjectedPoint holePoint, List<List<ProjectedPoint>> allLoops)
+    {
+        var bestIndex = 0;
+        var bestDistance = double.MaxValue;
+
+        for (var i = 0; i < outer.Count; i++)
+        {
+            if (!IsVisibleBridge(holePoint, outer[i], allLoops))
+            {
+                continue;
+            }
+
+            var distance = DistanceSquared(holePoint, outer[i]);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                bestIndex = i;
+            }
+        }
+
+        return bestIndex;
+    }
+
+    private static bool IsVisibleBridge(ProjectedPoint a, ProjectedPoint b, List<List<ProjectedPoint>> loops)
+    {
+        foreach (var loop in loops)
+        {
+            for (var i = 0; i < loop.Count; i++)
+            {
+                var c = loop[i];
+                var d = loop[(i + 1) % loop.Count];
+                if (SamePoint(a, c) || SamePoint(a, d) || SamePoint(b, c) || SamePoint(b, d))
+                {
+                    continue;
+                }
+
+                if (SegmentsIntersect(a, b, c, d))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static List<TriangleIndex> EarClip(List<ProjectedPoint> polygon)
+    {
+        RemoveConsecutiveDuplicates(polygon);
+        var result = new List<TriangleIndex>();
+        if (polygon.Count < 3)
+        {
+            return result;
+        }
+
+        if (SignedArea(polygon) < 0)
+        {
+            polygon.Reverse();
+        }
+
+        var indices = Enumerable.Range(0, polygon.Count).ToList();
+        var guard = polygon.Count * polygon.Count;
+        while (indices.Count > 3 && guard-- > 0)
+        {
+            var clipped = false;
+            for (var i = 0; i < indices.Count; i++)
+            {
+                var previous = indices[(i - 1 + indices.Count) % indices.Count];
+                var current = indices[i];
+                var next = indices[(i + 1) % indices.Count];
+
+                if (!IsEar(previous, current, next, indices, polygon))
+                {
+                    continue;
+                }
+
+                result.Add(new TriangleIndex(previous, current, next));
+                indices.RemoveAt(i);
+                clipped = true;
+                break;
+            }
+
+            if (!clipped)
+            {
+                return [];
+            }
+        }
+
+        if (indices.Count == 3 && Math.Abs(Cross(polygon[indices[0]], polygon[indices[1]], polygon[indices[2]])) > 1e-12)
+        {
+            result.Add(new TriangleIndex(indices[0], indices[1], indices[2]));
+        }
+
+        return result;
+    }
+
+    private static bool IsEar(int previous, int current, int next, List<int> indices, List<ProjectedPoint> polygon)
+    {
+        var a = polygon[previous];
+        var b = polygon[current];
+        var c = polygon[next];
+        if (Cross(a, b, c) <= 1e-12)
+        {
+            return false;
+        }
+
+        foreach (var index in indices)
+        {
+            if (index == previous || index == current || index == next)
+            {
+                continue;
+            }
+
+            if (PointInTriangle(polygon[index], a, b, c))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool PointInTriangle(ProjectedPoint p, ProjectedPoint a, ProjectedPoint b, ProjectedPoint c)
+    {
+        var c1 = Cross(a, b, p);
+        var c2 = Cross(b, c, p);
+        var c3 = Cross(c, a, p);
+        return c1 >= -1e-12 && c2 >= -1e-12 && c3 >= -1e-12;
+    }
+
+    private static double SignedArea(List<ProjectedPoint> points)
+    {
+        var area = 0.0;
+        for (var i = 0; i < points.Count; i++)
+        {
+            var a = points[i];
+            var b = points[(i + 1) % points.Count];
+            area += (a.X * b.Y) - (b.X * a.Y);
+        }
+
+        return area / 2.0;
+    }
+
+    private static double Cross(ProjectedPoint a, ProjectedPoint b, ProjectedPoint c)
+    {
+        return ((b.X - a.X) * (c.Y - a.Y)) - ((b.Y - a.Y) * (c.X - a.X));
+    }
+
+    private static bool SegmentsIntersect(ProjectedPoint a, ProjectedPoint b, ProjectedPoint c, ProjectedPoint d)
+    {
+        var d1 = Cross(a, b, c);
+        var d2 = Cross(a, b, d);
+        var d3 = Cross(c, d, a);
+        var d4 = Cross(c, d, b);
+        return ((d1 > 1e-12 && d2 < -1e-12) || (d1 < -1e-12 && d2 > 1e-12))
+            && ((d3 > 1e-12 && d4 < -1e-12) || (d3 < -1e-12 && d4 > 1e-12));
+    }
+
+    private static double DistanceSquared(ProjectedPoint a, ProjectedPoint b)
+    {
+        var dx = a.X - b.X;
+        var dy = a.Y - b.Y;
+        return (dx * dx) + (dy * dy);
+    }
+
+    private static bool SamePoint(ProjectedPoint a, ProjectedPoint b)
+    {
+        return DistanceSquared(a, b) <= 1e-12;
+    }
+
+    private static void RemoveConsecutiveDuplicates(List<ProjectedPoint> points)
+    {
+        for (var i = points.Count - 1; i >= 0; i--)
+        {
+            var previous = points[(i - 1 + points.Count) % points.Count];
+            if (SamePoint(points[i], previous))
+            {
+                points.RemoveAt(i);
+            }
+        }
+    }
+
+    private static void AddDistinctPoint(List<Point3d> points, Point3d point)
+    {
+        if (points.Count == 0 || !IsNear(points[^1], point))
+        {
+            points.Add(point);
+        }
+    }
+
+    private static void RemoveClosingDuplicate(List<Point3d> points)
+    {
+        if (points.Count > 1 && IsNear(points[0], points[^1]))
+        {
+            points.RemoveAt(points.Count - 1);
+        }
+    }
+
+    private static void RemoveCollinear(List<Point3d> points)
+    {
+        for (var i = points.Count - 1; i >= 0 && points.Count >= 3; i--)
+        {
+            var previous = points[(i - 1 + points.Count) % points.Count];
+            var current = points[i];
+            var next = points[(i + 1) % points.Count];
+            var normal = Vector3d.CrossProduct(current - previous, next - current);
+            if (normal.SquareLength <= 1e-12)
+            {
+                points.RemoveAt(i);
+            }
+        }
+    }
+
+    private static bool IsNear(Point3d a, Point3d b)
+    {
+        return a.DistanceToSquared(b) <= 1e-12;
+    }
+
+    private static Mesh? GetFirstMesh(params Func<Mesh?>[] factories)
+    {
+        foreach (var factory in factories)
+        {
+            var mesh = factory();
+            if (mesh is not null && mesh.Vertices.Count > 0 && mesh.Faces.Count > 0)
+            {
+                return mesh;
+            }
+        }
+
+        return null;
+    }
+
+    private static Mesh? DuplicateMesh(Mesh? mesh)
+    {
+        return mesh?.DuplicateMesh();
+    }
+
+    private sealed record ProjectedPoint(Point3d Point, double X, double Y);
+
+    private readonly record struct PointKey(long X, long Y, long Z)
+    {
+        public static PointKey From(Point3d point)
+        {
+            const double scale = 1_000_000.0;
+            return new PointKey(
+                (long)Math.Round(point.X * scale),
+                (long)Math.Round(point.Y * scale),
+                (long)Math.Round(point.Z * scale));
+        }
+    }
+
+    private readonly record struct TriangleIndex(int A, int B, int C);
+}
+}
+
+// -----------------------------------------------------------------------------
+// Source: Services/IfcModelBuilder.cs
+// -----------------------------------------------------------------------------
+namespace Rhino3dmToIfc.Console.Services
+{
+public sealed class IfcModelBuilder
+{
+    private readonly LogService _log;
+    private readonly IfcGeometryBuilder _geometryBuilder;
+    private readonly IfcPropertySetBuilder _propertySetBuilder;
+
+    public IfcModelBuilder(LogService log, IfcGeometryBuilder geometryBuilder, IfcPropertySetBuilder propertySetBuilder)
+    {
+        _log = log;
+        _geometryBuilder = geometryBuilder;
+        _propertySetBuilder = propertySetBuilder;
+    }
+
+    public void BuildAndSave(
+        IReadOnlyList<RhinoBimObject> objects,
+        IReadOnlyList<RhinoLayerInfo> rhinoLayers,
+        IfcExportOptions options,
+        ExportSummary summary)
+    {
+        ConfigureXbim();
+
+        var credentials = new XbimEditorCredentials
+        {
+            ApplicationDevelopersName = "Rhino3dmToIfc",
+            ApplicationFullName = "Rhino3dmToIfc.Console",
+            ApplicationIdentifier = "Rhino3dmToIfc.Console",
+            ApplicationVersion = "1.0",
+            EditorsFamilyName = "Console",
+            EditorsGivenName = "Rhino3dmToIfc",
+            EditorsOrganisationName = "Rhino3dmToIfc"
+        };
+
+        using var model = IfcStore.Create(credentials, XbimSchemaVersion.Ifc4, XbimStoreType.InMemoryModel);
+        using (var transaction = model.BeginTransaction("Create IFC4 model"))
+        {
+            var ownerHistory = CreateOwnerHistory(model);
+            var context = CreateGeometricRepresentationContext(model);
+            var project = CreateProject(model, ownerHistory, context);
+            var site = CreateSpatialElement<IfcSite>(model, ownerHistory, "Default Site");
+            var building = CreateSpatialElement<IfcBuilding>(model, ownerHistory, "Default Building");
+
+            Relate(model, ownerHistory, project, site, "Project contains site");
+            Relate(model, ownerHistory, site, building, "Site contains building");
+
+            var storeys = new Dictionary<string, IfcBuildingStorey>(StringComparer.OrdinalIgnoreCase);
+            var materials = new Dictionary<string, IfcMaterial>(StringComparer.OrdinalIgnoreCase);
+            var layers = new Dictionary<string, IfcPresentationLayerAssignment>(StringComparer.OrdinalIgnoreCase);
+            var layerGroups = new Dictionary<string, IfcGroup>(StringComparer.OrdinalIgnoreCase);
+            var layerProductRelations = new Dictionary<string, IfcRelAssignsToGroup>(StringComparer.OrdinalIgnoreCase);
+            var rootLayerRelation = CreateRootLayerGroup(model, ownerHistory, rhinoLayers, layerGroups);
+
+            foreach (var source in objects)
+            {
+                if (!source.IsSupportedGeometry)
+                {
+                    summary.SkippedObjects++;
+                    continue;
+                }
+
+                try
+                {
+                    var product = CreateProduct(model, ownerHistory, source);
+                    product.ObjectPlacement = CreateLocalPlacement(model);
+
+                    if (!_geometryBuilder.TryAttachMeshRepresentation(product, source, context, layers, out var skipReason))
+                    {
+                        source.SkipReason = skipReason;
+                        summary.SkippedObjects++;
+                        continue;
+                    }
+
+                    var storey = GetOrCreateStorey(model, ownerHistory, building, storeys, source.IfcStorey);
+                    Contain(model, ownerHistory, storey, product);
+                    AssociateMaterial(model, ownerHistory, product, source.IfcMaterial, materials);
+                    _propertySetBuilder.AttachPropertySets(product, source, summary);
+                    AssignProductToLayerGroups(model, ownerHistory, product, source, layerGroups, layerProductRelations, rootLayerRelation);
+
+                    summary.ExportedObjects++;
+                    _log.Info($"Exported {source.RhinoObjectId} as {source.IfcType} '{source.IfcName}'.");
+                }
+                catch (Exception ex)
+                {
+                    summary.FailedObjects++;
+                    _log.Error($"Failed to export object {source.RhinoObjectId}.", ex);
+                }
+            }
+
+            transaction.Commit();
+        }
+
+        model.SaveAs(options.OutputPath);
+        _log.Info($"Saved IFC file: {options.OutputPath}");
+    }
+
+    private static void ConfigureXbim()
+    {
+        if (!XbimServices.Current.IsConfigured)
+        {
+            XbimServices.Current.ConfigureServices(services => services.AddXbimToolkit());
+        }
+    }
+
+    private static IfcOwnerHistory CreateOwnerHistory(IfcStore model)
+    {
+        var organization = model.Instances.New<IfcOrganization>();
+        organization.Name = "Rhino3dmToIfc";
+
+        var person = model.Instances.New<IfcPerson>();
+        person.FamilyName = "Console";
+        person.GivenName = "Rhino3dmToIfc";
+
+        var personAndOrganization = model.Instances.New<IfcPersonAndOrganization>();
+        personAndOrganization.ThePerson = person;
+        personAndOrganization.TheOrganization = organization;
+
+        var application = model.Instances.New<IfcApplication>();
+        application.ApplicationDeveloper = organization;
+        application.ApplicationFullName = "Rhino3dmToIfc.Console";
+        application.ApplicationIdentifier = "Rhino3dmToIfc.Console";
+        application.Version = "1.0";
+
+        var ownerHistory = model.Instances.New<IfcOwnerHistory>();
+        ownerHistory.OwningApplication = application;
+        ownerHistory.OwningUser = personAndOrganization;
+        ownerHistory.ChangeAction = IfcChangeActionEnum.ADDED;
+        ownerHistory.CreationDate = new IfcTimeStamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        return ownerHistory;
+    }
+
+    private static IfcProject CreateProject(IfcStore model, IfcOwnerHistory ownerHistory, IfcGeometricRepresentationContext context)
+    {
+        var project = model.Instances.New<IfcProject>();
+        project.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        project.OwnerHistory = ownerHistory;
+        project.Name = "Rhino3dm IFC4 Export";
+        project.RepresentationContexts.Add(context);
+        project.UnitsInContext = CreateUnitAssignment(model);
+        return project;
+    }
+
+    private static IfcUnitAssignment CreateUnitAssignment(IfcStore model)
+    {
+        var unitAssignment = model.Instances.New<IfcUnitAssignment>();
+        var lengthUnit = model.Instances.New<IfcSIUnit>();
+        lengthUnit.UnitType = IfcUnitEnum.LENGTHUNIT;
+        lengthUnit.Name = IfcSIUnitName.METRE;
+        unitAssignment.Units.Add(lengthUnit);
+        return unitAssignment;
+    }
+
+    private static IfcGeometricRepresentationContext CreateGeometricRepresentationContext(IfcStore model)
+    {
+        var context = model.Instances.New<IfcGeometricRepresentationContext>();
+        context.ContextIdentifier = "Body";
+        context.ContextType = "Model";
+        context.CoordinateSpaceDimension = 3;
+        context.Precision = 1e-5;
+        context.WorldCoordinateSystem = CreateAxisPlacement(model);
+        return context;
+    }
+
+    private static T CreateSpatialElement<T>(IfcStore model, IfcOwnerHistory ownerHistory, string name)
+        where T : IfcSpatialStructureElement, IInstantiableEntity
+    {
+        var element = model.Instances.New<T>();
+        element.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        element.OwnerHistory = ownerHistory;
+        element.Name = name;
+        element.ObjectPlacement = CreateLocalPlacement(model);
+        return element;
+    }
+
+    private static IfcBuildingStorey GetOrCreateStorey(
+        IfcStore model,
+        IfcOwnerHistory ownerHistory,
+        IfcBuilding building,
+        Dictionary<string, IfcBuildingStorey> storeys,
+        string storeyName)
+    {
+        var normalizedName = string.IsNullOrWhiteSpace(storeyName) ? "Level 1" : storeyName.Trim();
+        if (storeys.TryGetValue(normalizedName, out var existing))
+        {
+            return existing;
+        }
+
+        var storey = CreateSpatialElement<IfcBuildingStorey>(model, ownerHistory, normalizedName);
+        Relate(model, ownerHistory, building, storey, $"Building contains {normalizedName}");
+        storeys[normalizedName] = storey;
+        return storey;
+    }
+
+    private static IfcProduct CreateProduct(IfcStore model, IfcOwnerHistory ownerHistory, RhinoBimObject source)
+    {
+        IfcProduct product = source.IfcType switch
+        {
+            "IfcWall" => model.Instances.New<IfcWall>(),
+            "IfcSlab" => model.Instances.New<IfcSlab>(),
+            "IfcColumn" => model.Instances.New<IfcColumn>(),
+            "IfcBeam" => model.Instances.New<IfcBeam>(),
+            "IfcDoor" => model.Instances.New<IfcDoor>(),
+            "IfcWindow" => model.Instances.New<IfcWindow>(),
+            "IfcRoof" => model.Instances.New<IfcRoof>(),
+            "IfcStair" => model.Instances.New<IfcStair>(),
+            "IfcRailing" => model.Instances.New<IfcRailing>(),
+            "IfcCovering" => model.Instances.New<IfcCovering>(),
+            "IfcMember" => model.Instances.New<IfcMember>(),
+            _ => model.Instances.New<IfcBuildingElementProxy>()
+        };
+
+        product.GlobalId = source.IfcGlobalId;
+        product.OwnerHistory = ownerHistory;
+        product.Name = string.IsNullOrWhiteSpace(source.IfcName) ? source.ObjectName : source.IfcName;
+        if (!string.IsNullOrWhiteSpace(source.IfcObjectType))
+        {
+            product.ObjectType = source.IfcObjectType.Trim();
+        }
+
+        ApplyIfcClassification(product, source);
+
+        if (!string.IsNullOrWhiteSpace(source.IfcDescription))
+        {
+            product.Description = source.IfcDescription;
+        }
+
+        return product;
+    }
+
+    private static void ApplyIfcClassification(IfcProduct product, RhinoBimObject source)
+    {
+        if (product is IfcCovering covering)
+        {
+            covering.PredefinedType = ParseCoveringType(source.IfcPredefinedType);
+            return;
+        }
+
+        if (product is IfcMember member)
+        {
+            member.PredefinedType = ParseMemberType(source.IfcPredefinedType);
+        }
+    }
+
+    private static IfcCoveringTypeEnum? ParseCoveringType(string value)
+    {
+        return Enum.TryParse<IfcCoveringTypeEnum>(NormalizePredefinedType(value), true, out var parsed)
+            ? parsed
+            : null;
+    }
+
+    private static IfcMemberTypeEnum? ParseMemberType(string value)
+    {
+        return Enum.TryParse<IfcMemberTypeEnum>(NormalizePredefinedType(value), true, out var parsed)
+            ? parsed
+            : null;
+    }
+
+    private static string NormalizePredefinedType(string value)
+    {
+        return string.IsNullOrWhiteSpace(value)
+            ? string.Empty
+            : value.Trim().Replace(".", string.Empty).Replace(" ", string.Empty).Replace("-", string.Empty).ToUpperInvariant();
+    }
+
+    private static void Relate(IfcStore model, IfcOwnerHistory ownerHistory, IfcObjectDefinition relatingObject, IfcObjectDefinition relatedObject, string name)
+    {
+        var relation = model.Instances.New<IfcRelAggregates>();
+        relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        relation.OwnerHistory = ownerHistory;
+        relation.Name = name;
+        relation.RelatingObject = relatingObject;
+        relation.RelatedObjects.Add(relatedObject);
+    }
+
+    private static void Contain(IfcStore model, IfcOwnerHistory ownerHistory, IfcBuildingStorey storey, IfcProduct product)
+    {
+        var relation = model.Instances.New<IfcRelContainedInSpatialStructure>();
+        relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        relation.OwnerHistory = ownerHistory;
+        relation.Name = $"Storey contains {product.Name}";
+        relation.RelatingStructure = storey;
+        relation.RelatedElements.Add(product);
+    }
+
+    private static void AssociateMaterial(
+        IfcStore model,
+        IfcOwnerHistory ownerHistory,
+        IfcProduct product,
+        string materialName,
+        Dictionary<string, IfcMaterial> materials)
+    {
+        if (string.IsNullOrWhiteSpace(materialName))
+        {
+            return;
+        }
+
+        if (!materials.TryGetValue(materialName, out var material))
+        {
+            material = model.Instances.New<IfcMaterial>();
+            material.Name = materialName.Trim();
+            materials[materialName] = material;
+        }
+
+        var relation = model.Instances.New<IfcRelAssociatesMaterial>();
+        relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        relation.OwnerHistory = ownerHistory;
+        relation.RelatingMaterial = material;
+        relation.RelatedObjects.Add(product);
+    }
+
+    private static void AssignProductToLayerGroup(
+        IfcStore model,
+        IfcOwnerHistory ownerHistory,
+        IfcProduct product,
+        string layerName,
+        Dictionary<string, IfcGroup> layerGroups,
+        Dictionary<string, IfcRelAssignsToGroup> layerProductRelations,
+        IfcRelAssignsToGroup? rootLayerRelation)
+    {
+        var normalizedLayerName = string.IsNullOrWhiteSpace(layerName) ? "Default" : layerName.Trim();
+        var group = GetOrCreateLayerGroup(model, ownerHistory, normalizedLayerName, layerGroups);
+        AddLayerGroupToRoot(rootLayerRelation, group);
+
+        if (!layerProductRelations.TryGetValue(normalizedLayerName, out var relation))
+        {
+            relation = model.Instances.New<IfcRelAssignsToGroup>();
+            relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+            relation.OwnerHistory = ownerHistory;
+            relation.Name = $"Products on Rhino layer {normalizedLayerName}";
+            relation.RelatingGroup = group;
+            layerProductRelations[normalizedLayerName] = relation;
+        }
+
+        relation.RelatedObjects.Add(product);
+    }
+
+    private static void AssignProductToLayerGroups(
+        IfcStore model,
+        IfcOwnerHistory ownerHistory,
+        IfcProduct product,
+        RhinoBimObject source,
+        Dictionary<string, IfcGroup> layerGroups,
+        Dictionary<string, IfcRelAssignsToGroup> layerProductRelations,
+        IfcRelAssignsToGroup? rootLayerRelation)
+    {
+        foreach (var layerName in GetObjectLayerNames(source))
+        {
+            AssignProductToLayerGroup(model, ownerHistory, product, layerName, layerGroups, layerProductRelations, rootLayerRelation);
+        }
+    }
+
+    private static IEnumerable<string> GetObjectLayerNames(RhinoBimObject source)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var primaryLayerName = string.IsNullOrWhiteSpace(source.LayerName) ? "Default" : source.LayerName.Trim();
+        if (seen.Add(primaryLayerName))
+        {
+            yield return primaryLayerName;
+        }
+
+        foreach (var layerName in source.AdditionalLayerNames)
+        {
+            if (!string.IsNullOrWhiteSpace(layerName) && seen.Add(layerName.Trim()))
+            {
+                yield return layerName.Trim();
+            }
+        }
+    }
+
+    private static IfcRelAssignsToGroup? CreateRootLayerGroup(
+        IfcStore model,
+        IfcOwnerHistory ownerHistory,
+        IReadOnlyList<RhinoLayerInfo> rhinoLayers,
+        Dictionary<string, IfcGroup> layerGroups)
+    {
+        if (rhinoLayers.Count == 0)
+        {
+            return null;
+        }
+
+        var rootGroup = model.Instances.New<IfcGroup>();
+        rootGroup.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        rootGroup.OwnerHistory = ownerHistory;
+        rootGroup.Name = "Rhino Layers";
+        rootGroup.Description = "All Rhino layers from the source 3DM file";
+        rootGroup.ObjectType = "Rhino Layer Root";
+
+        var relation = model.Instances.New<IfcRelAssignsToGroup>();
+        relation.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        relation.OwnerHistory = ownerHistory;
+        relation.Name = "Rhino layer list";
+        relation.RelatingGroup = rootGroup;
+
+        foreach (var layer in rhinoLayers)
+        {
+            var group = GetOrCreateLayerGroup(model, ownerHistory, layer.Name, layerGroups);
+            AddLayerGroupToRoot(relation, group);
+        }
+
+        return relation;
+    }
+
+    private static IfcGroup GetOrCreateLayerGroup(
+        IfcStore model,
+        IfcOwnerHistory ownerHistory,
+        string layerName,
+        Dictionary<string, IfcGroup> layerGroups)
+    {
+        var normalizedLayerName = string.IsNullOrWhiteSpace(layerName) ? "Default" : layerName.Trim();
+        if (layerGroups.TryGetValue(normalizedLayerName, out var existing))
+        {
+            return existing;
+        }
+
+        var group = model.Instances.New<IfcGroup>();
+        group.GlobalId = IfcGloballyUniqueId.ConvertToBase64(Guid.NewGuid());
+        group.OwnerHistory = ownerHistory;
+        group.Name = normalizedLayerName;
+        group.Description = $"Rhino layer: {normalizedLayerName}";
+        group.ObjectType = "Rhino Layer";
+        layerGroups[normalizedLayerName] = group;
+        return group;
+    }
+
+    private static void AddLayerGroupToRoot(IfcRelAssignsToGroup? rootLayerRelation, IfcGroup group)
+    {
+        if (rootLayerRelation is null || rootLayerRelation.RelatedObjects.Contains(group))
+        {
+            return;
+        }
+
+        rootLayerRelation.RelatedObjects.Add(group);
+    }
+
+    private static IfcLocalPlacement CreateLocalPlacement(IfcStore model)
+    {
+        var placement = model.Instances.New<IfcLocalPlacement>();
+        placement.RelativePlacement = CreateAxisPlacement(model);
+        return placement;
+    }
+
+    private static IfcAxis2Placement3D CreateAxisPlacement(IfcStore model)
+    {
+        var origin = model.Instances.New<IfcCartesianPoint>();
+        origin.SetXYZ(0, 0, 0);
+
+        var placement = model.Instances.New<IfcAxis2Placement3D>();
+        placement.Location = origin;
+        return placement;
+    }
+}
+}

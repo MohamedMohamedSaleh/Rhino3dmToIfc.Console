@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <Compile Include="Program.cs" />
+    <Compile Include="Rhino3dmToIfcConverter.cs" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
     <PackageReference Include="Rhino3dm" Version="8.17.0" />
     <PackageReference Include="Xbim.Essentials" Version="6.0.587" />
